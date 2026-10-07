@@ -1,0 +1,11 @@
+port: 8080
+
+routes:
+  - path: "/api"
+    backends:
+      - url: "http://localhost:9001"
+      - url: "http://localhost:9002"
+
+  - path: "/"
+    backends:
+      - url: "http://localhost:9000"
