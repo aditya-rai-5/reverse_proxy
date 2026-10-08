@@ -36,9 +36,19 @@ func New(cfg *config.Config) (*Router, error) {
 
 func (r *Router) Match(requestPath string) (*loadbalancer.LoadBalancer, error) {
 	for _, e := range r.routes {
-		if strings.HasPrefix(requestPath, e.path) {
+		if matchesPath(requestPath, e.path) {
 			return e.lb, nil
 		}
 	}
 	return nil, fmt.Errorf("no route matched for path: %s", requestPath)
+}
+
+func matchesPath(requestPath, routePath string) bool {
+	if !strings.HasPrefix(requestPath, routePath) {
+		return false
+	}
+	if routePath == "/" || len(requestPath) == len(routePath) {
+		return true
+	}
+	return requestPath[len(routePath)] == '/'
 }
