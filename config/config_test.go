@@ -12,6 +12,7 @@ func TestLoadConfigWithDefaults(t *testing.T) {
 port: 8080
 routes:
   - path: "/api"
+    strip_prefix: "/api"
     backends:
       - url: "http://localhost:9001"
 `)
@@ -34,6 +35,9 @@ routes:
 	if cfg.Routes[0].Path != "/api" {
 		t.Errorf("Expected route path '/api', got %q", cfg.Routes[0].Path)
 	}
+	if cfg.Routes[0].StripPrefix != "/api" {
+		t.Errorf("Expected strip_prefix '/api', got %q", cfg.Routes[0].StripPrefix)
+	}
 	if len(cfg.Routes[0].Backends) != 1 {
 		t.Fatalf("Expected 1 backend, got %d", len(cfg.Routes[0].Backends))
 	}
@@ -50,6 +54,38 @@ routes:
 	}
 	if cfg.HealthCheck.Timeout != 5*time.Second {
 		t.Errorf("Expected default timeout 5s, got %v", cfg.HealthCheck.Timeout)
+	}
+}
+
+func TestLoadConfigWithRewrite(t *testing.T) {
+	yamlData := []byte(`
+port: 8080
+routes:
+  - path: "/legacy"
+    rewrite:
+      pattern: "^/legacy/(.*)$"
+      replacement: "/v2/$1"
+    backends:
+      - url: "http://localhost:9001"
+`)
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, yamlData, 0644); err != nil {
+		t.Fatalf("Failed to write temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if cfg.Routes[0].Rewrite == nil {
+		t.Fatal("Expected rewrite rule to be loaded, got nil")
+	}
+	if cfg.Routes[0].Rewrite.Pattern != "^/legacy/(.*)$" {
+		t.Errorf("Expected pattern '^/legacy/(.*)$', got %q", cfg.Routes[0].Rewrite.Pattern)
+	}
+	if cfg.Routes[0].Rewrite.Replacement != "/v2/$1" {
+		t.Errorf("Expected replacement '/v2/$1', got %q", cfg.Routes[0].Rewrite.Replacement)
 	}
 }
 
@@ -103,6 +139,24 @@ func TestValidate(t *testing.T) {
 			expectError: false,
 		},
 		{
+			name: "Valid Config With StripPrefix and Rewrite",
+			cfg: &Config{
+				Port: 8080,
+				Routes: []Route{
+					{
+						Path:        "/api",
+						StripPrefix: "/api",
+						Rewrite: &RewriteRule{
+							Pattern:     "^/v1/(.*)$",
+							Replacement: "/v2/$1",
+						},
+						Backends: []Backend{{URL: "http://localhost"}},
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
 			name: "Missing Port",
 			cfg: &Config{
 				Routes: []Route{
@@ -124,6 +178,48 @@ func TestValidate(t *testing.T) {
 				Port: 8080,
 				Routes: []Route{
 					{Path: "", Backends: []Backend{{URL: "http://localhost"}}},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "Invalid StripPrefix Without Leading Slash",
+			cfg: &Config{
+				Port: 8080,
+				Routes: []Route{
+					{
+						Path:        "/api",
+						StripPrefix: "api", // Missing leading slash
+						Backends:    []Backend{{URL: "http://localhost"}},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "Empty Rewrite Pattern",
+			cfg: &Config{
+				Port: 8080,
+				Routes: []Route{
+					{
+						Path:     "/api",
+						Rewrite:  &RewriteRule{Pattern: "", Replacement: "/test"},
+						Backends: []Backend{{URL: "http://localhost"}},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "Invalid Rewrite Regex",
+			cfg: &Config{
+				Port: 8080,
+				Routes: []Route{
+					{
+						Path:     "/api",
+						Rewrite:  &RewriteRule{Pattern: "[a-z", Replacement: "/test"},
+						Backends: []Backend{{URL: "http://localhost"}},
+					},
 				},
 			},
 			expectError: true,

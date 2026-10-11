@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -12,9 +14,17 @@ type Backend struct {
 	URL string `yaml:"url"`
 }
 
+// RewriteRule defines regex pattern replacement for a route's path.
+type RewriteRule struct {
+	Pattern     string `yaml:"pattern"`
+	Replacement string `yaml:"replacement"`
+}
+
 type Route struct {
-	Path     string    `yaml:"path"`
-	Backends []Backend `yaml:"backends"`
+	Path        string       `yaml:"path"`
+	StripPrefix string       `yaml:"strip_prefix"`
+	Rewrite     *RewriteRule `yaml:"rewrite"`
+	Backends    []Backend    `yaml:"backends"`
 }
 
 // HealthCheck holds configuration for backend health probing.
@@ -77,6 +87,17 @@ func validate(cfg *Config) error {
 	for i, route := range cfg.Routes {
 		if route.Path == "" {
 			return fmt.Errorf("route[%d]: path must not be empty", i)
+		}
+		if route.StripPrefix != "" && !strings.HasPrefix(route.StripPrefix, "/") {
+			return fmt.Errorf("route[%d]: strip_prefix must start with '/'", i)
+		}
+		if route.Rewrite != nil {
+			if route.Rewrite.Pattern == "" {
+				return fmt.Errorf("route[%d]: rewrite pattern must not be empty", i)
+			}
+			if _, err := regexp.Compile(route.Rewrite.Pattern); err != nil {
+				return fmt.Errorf("route[%d]: invalid rewrite pattern %q: %w", i, route.Rewrite.Pattern, err)
+			}
 		}
 		if len(route.Backends) == 0 {
 			return fmt.Errorf("route[%d]: at least one backend must be defined", i)

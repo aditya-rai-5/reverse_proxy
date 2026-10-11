@@ -67,6 +67,147 @@ func TestProxyForwarding(t *testing.T) {
 	_ = receivedHost
 }
 
+func TestProxyStripPrefix(t *testing.T) {
+	var receivedPath, receivedQuery string
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("stripped"))
+	}))
+	defer backend.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:        "/api",
+				StripPrefix: "/api",
+				Backends:    []config.Backend{{URL: backend.URL}},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/users?status=active", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	res := rec.Result()
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", res.StatusCode)
+	}
+
+	if receivedPath != "/v1/users" {
+		t.Errorf("Expected backend to receive path '/v1/users', got %q", receivedPath)
+	}
+
+	if receivedQuery != "status=active" {
+		t.Errorf("Expected query 'status=active' to be preserved, got %q", receivedQuery)
+	}
+}
+
+func TestProxyStripPrefixExactMatch(t *testing.T) {
+	var receivedPath string
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:        "/api",
+				StripPrefix: "/api",
+				Backends:    []config.Backend{{URL: backend.URL}},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/api", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	res := rec.Result()
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", res.StatusCode)
+	}
+
+	if receivedPath != "/" {
+		t.Errorf("Expected backend to receive '/', got %q", receivedPath)
+	}
+}
+
+func TestProxyRewrite(t *testing.T) {
+	var receivedPath, receivedQuery string
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("rewritten"))
+	}))
+	defer backend.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path: "/legacy",
+				Rewrite: &config.RewriteRule{
+					Pattern:     "^/legacy/(.*)$",
+					Replacement: "/v2/$1",
+				},
+				Backends: []config.Backend{{URL: backend.URL}},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/legacy/orders?page=2", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	res := rec.Result()
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", res.StatusCode)
+	}
+
+	if receivedPath != "/v2/orders" {
+		t.Errorf("Expected backend to receive rewritten path '/v2/orders', got %q", receivedPath)
+	}
+
+	if receivedQuery != "page=2" {
+		t.Errorf("Expected query 'page=2' to be preserved, got %q", receivedQuery)
+	}
+}
+
 func TestProxyNoRoute(t *testing.T) {
 	cfg := &config.Config{
 		Port: 8080,

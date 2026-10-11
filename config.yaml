@@ -1,11 +1,19 @@
 port: 8080
 
+health_check:
+  path: "/health"
+  interval: 10s
+  timeout: 5s
+
 routes:
+  # Path stripping example: /api/users -> forwarded as /users
   - path: "/api"
+    strip_prefix: "/api"
     backends:
       - url: "http://localhost:9001"
       - url: "http://localhost:9002"
 
+  # Fallback root route
   - path: "/"
     backends:
       - url: "http://localhost:9000"
