@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,9 +17,33 @@ type Route struct {
 	Backends []Backend `yaml:"backends"`
 }
 
+// HealthCheck holds configuration for backend health probing.
+type HealthCheck struct {
+	// Path is the HTTP path to probe on each backend (default: "/health").
+	Path string `yaml:"path"`
+	// Interval is how often to probe each backend (default: 10s).
+	Interval time.Duration `yaml:"interval"`
+	// Timeout is the maximum time to wait for a probe response (default: 5s).
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// defaults fills in zero-value fields with sensible defaults.
+func (hc *HealthCheck) defaults() {
+	if hc.Path == "" {
+		hc.Path = "/health"
+	}
+	if hc.Interval <= 0 {
+		hc.Interval = 10 * time.Second
+	}
+	if hc.Timeout <= 0 {
+		hc.Timeout = 5 * time.Second
+	}
+}
+
 type Config struct {
-	Port   int     `yaml:"port"`
-	Routes []Route `yaml:"routes"`
+	Port        int         `yaml:"port"`
+	Routes      []Route     `yaml:"routes"`
+	HealthCheck HealthCheck `yaml:"health_check"`
 }
 
 func Load(path string) (*Config, error) {
@@ -31,6 +56,9 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+
+	// Apply defaults before validation so validate() sees resolved values.
+	cfg.HealthCheck.defaults()
 
 	if err := validate(&cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)

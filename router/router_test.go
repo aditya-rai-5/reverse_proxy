@@ -55,8 +55,12 @@ func TestRouterMatchPriority(t *testing.T) {
 		t.Fatalf("Failed to create router: %v", err)
 	}
 
-	if r.routes[0].path != "/api/v2" {
-		t.Errorf("Expected longest path first, got %q", r.routes[0].path)
+	entries := r.Entries()
+	if len(entries) != 3 {
+		t.Fatalf("Expected 3 entries, got %d", len(entries))
+	}
+	if entries[0].Path != "/api/v2" {
+		t.Errorf("Expected longest path first, got %q", entries[0].Path)
 	}
 
 	tests := []struct {
@@ -89,10 +93,38 @@ func TestRouterMatchPriority(t *testing.T) {
 				return
 			}
 
-			target := lb.Next()
+			target, err := lb.Next()
+			if err != nil {
+				t.Fatalf("Unexpected error from Next(): %v", err)
+			}
 			if target.String() != tt.expectedURL {
 				t.Errorf("Match(%q) routed to %q, expected %q", tt.requestPath, target.String(), tt.expectedURL)
 			}
 		})
+	}
+}
+
+func TestRouterEntries(t *testing.T) {
+	cfg := &config.Config{
+		Routes: []config.Route{
+			{Path: "/web", Backends: []config.Backend{{URL: "http://web1"}, {URL: "http://web2"}}},
+			{Path: "/api", Backends: []config.Backend{{URL: "http://api1"}}},
+		},
+	}
+
+	r, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	entries := r.Entries()
+	if len(entries) != 2 {
+		t.Fatalf("Expected 2 entries, got %d", len(entries))
+	}
+
+	for _, entry := range entries {
+		if entry.LB == nil {
+			t.Errorf("Expected non-nil LB for path %s", entry.Path)
+		}
 	}
 }

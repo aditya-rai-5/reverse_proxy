@@ -4,9 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
-func TestLoadConfig(t *testing.T) {
+func TestLoadConfigWithDefaults(t *testing.T) {
 	validYAML := []byte(`
 port: 8080
 routes:
@@ -38,6 +39,50 @@ routes:
 	}
 	if cfg.Routes[0].Backends[0].URL != "http://localhost:9001" {
 		t.Errorf("Expected backend URL 'http://localhost:9001', got %q", cfg.Routes[0].Backends[0].URL)
+	}
+
+	// Verify health check defaults
+	if cfg.HealthCheck.Path != "/health" {
+		t.Errorf("Expected default health check path '/health', got %q", cfg.HealthCheck.Path)
+	}
+	if cfg.HealthCheck.Interval != 10*time.Second {
+		t.Errorf("Expected default interval 10s, got %v", cfg.HealthCheck.Interval)
+	}
+	if cfg.HealthCheck.Timeout != 5*time.Second {
+		t.Errorf("Expected default timeout 5s, got %v", cfg.HealthCheck.Timeout)
+	}
+}
+
+func TestLoadConfigCustomHealthCheck(t *testing.T) {
+	customYAML := []byte(`
+port: 9090
+routes:
+  - path: "/v1"
+    backends:
+      - url: "http://localhost:8001"
+health_check:
+  path: "/ping"
+  interval: 2s
+  timeout: 1s
+`)
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, customYAML, 0644); err != nil {
+		t.Fatalf("Failed to write temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if cfg.HealthCheck.Path != "/ping" {
+		t.Errorf("Expected custom path '/ping', got %q", cfg.HealthCheck.Path)
+	}
+	if cfg.HealthCheck.Interval != 2*time.Second {
+		t.Errorf("Expected custom interval 2s, got %v", cfg.HealthCheck.Interval)
+	}
+	if cfg.HealthCheck.Timeout != 1*time.Second {
+		t.Errorf("Expected custom timeout 1s, got %v", cfg.HealthCheck.Timeout)
 	}
 }
 
