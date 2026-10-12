@@ -2,6 +2,8 @@ package loadbalancer
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 
@@ -201,5 +203,510 @@ func TestBackendURL(t *testing.T) {
 	}
 	if lb.BackendURL(1).String() != "http://server2:9002" {
 		t.Errorf("Expected http://server2:9002, got %s", lb.BackendURL(1).String())
+	}
+}
+
+func TestWeightedRoundRobinRatioAndInterleaving(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://server1", Weight: 2},
+		{URL: "http://server2", Weight: 1},
+	}
+
+	lb, err := New(backends, WithAlgorithm(config.AlgorithmWeightedRoundRobin))
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	if lb.Algorithm() != config.AlgorithmWeightedRoundRobin {
+		t.Errorf("Expected algorithm %q, got %q", config.AlgorithmWeightedRoundRobin, lb.Algorithm())
+	}
+	if lb.Weight(0) != 2 || lb.Weight(1) != 1 {
+		t.Errorf("Expected weights 2 and 1, got %d and %d", lb.Weight(0), lb.Weight(1))
+	}
+
+	// Smooth WRR interleaves: with weights 2 and 1, the 3-cycle is: server1, server2, server1
+	expectedFirst3 := []string{"http://server1", "http://server2", "http://server1"}
+	for i, expected := range expectedFirst3 {
+		res, err := lb.Select(nil)
+		if err != nil {
+			t.Fatalf("Request %d failed: %v", i, err)
+		}
+		if res.URL.String() != expected {
+			t.Errorf("Request %d: expected %s, got %s", i, expected, res.URL.String())
+		}
+	}
+
+	// Run 300 total requests (including the 3 above = 297 more)
+	counts := make(map[string]int)
+	counts["http://server1"] = 2
+	counts["http://server2"] = 1
+
+	for i := 0; i < 297; i++ {
+		res, err := lb.Select(nil)
+		if err != nil {
+			t.Fatalf("Iteration %d failed: %v", i, err)
+		}
+		counts[res.URL.String()]++
+	}
+
+	if counts["http://server1"] != 200 {
+		t.Errorf("Expected server1 to receive 200 requests, got %d", counts["http://server1"])
+	}
+	if counts["http://server2"] != 100 {
+		t.Errorf("Expected server2 to receive 100 requests, got %d", counts["http://server2"])
+	}
+}
+
+func TestWeightedRoundRobinHealthFailover(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://heavy", Weight: 3},
+		{URL: "http://light", Weight: 1},
+	}
+
+	lb, err := New(backends, WithAlgorithm(config.AlgorithmWeightedRoundRobin))
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	// Mark heavy server unhealthy
+	lb.MarkHealthy(0, false)
+
+	// All traffic must go to light server
+	for i := 0; i < 5; i++ {
+		res, err := lb.Select(nil)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if res.URL.String() != "http://light" {
+			t.Errorf("Expected traffic to route to light server, got %s", res.URL.String())
+		}
+	}
+
+	// Recover heavy server
+	lb.MarkHealthy(0, true)
+
+	counts := make(map[string]int)
+	for i := 0; i < 400; i++ {
+		res, err := lb.Select(nil)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		counts[res.URL.String()]++
+	}
+
+	if counts["http://heavy"] != 300 {
+		t.Errorf("Expected recovered heavy server to get 300 requests, got %d", counts["http://heavy"])
+	}
+	if counts["http://light"] != 100 {
+		t.Errorf("Expected light server to get 100 requests, got %d", counts["http://light"])
+	}
+}
+
+func TestConcurrentWeightedRoundRobin(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://srv1", Weight: 3},
+		{URL: "http://srv2", Weight: 1},
+	}
+
+	lb, err := New(backends, WithAlgorithm(config.AlgorithmWeightedRoundRobin))
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	const workers = 50
+	const perWorker = 20 // 1000 total
+
+	results := make(chan string, workers*perWorker)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				res, err := lb.Select(nil)
+				if err != nil {
+					t.Errorf("Select error: %v", err)
+					return
+				}
+				results <- res.URL.String()
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	counts := make(map[string]int)
+	for u := range results {
+		counts[u]++
+	}
+
+	if counts["http://srv1"] != 750 {
+		t.Errorf("Expected srv1 to get 750 requests, got %d", counts["http://srv1"])
+	}
+	if counts["http://srv2"] != 250 {
+		t.Errorf("Expected srv2 to get 250 requests, got %d", counts["http://srv2"])
+	}
+}
+
+func TestLeastConnections(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://server1"},
+		{URL: "http://server2"},
+	}
+
+	lb, err := New(backends, WithAlgorithm(config.AlgorithmLeastConn))
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	// First request: picks server1 (0 in flight)
+	res1, err := lb.Select(nil)
+	if err != nil {
+		t.Fatalf("Select 1 failed: %v", err)
+	}
+	if res1.Done == nil {
+		t.Fatal("Expected Done callback to be non-nil for least_conn")
+	}
+
+	// Server 1 should now have 1 active connection, Server 2 has 0
+	if lb.ActiveConnections(0) != 1 {
+		t.Errorf("Expected backend 0 to have 1 active connection, got %d", lb.ActiveConnections(0))
+	}
+	if lb.ActiveConnections(1) != 0 {
+		t.Errorf("Expected backend 1 to have 0 active connections, got %d", lb.ActiveConnections(1))
+	}
+
+	// Second request: must route to server2 (which has 0 in flight, less than server1's 1)
+	res2, err := lb.Select(nil)
+	if err != nil {
+		t.Fatalf("Select 2 failed: %v", err)
+	}
+	if res2.URL.String() != "http://server2" {
+		t.Errorf("Expected Select 2 to choose server2, got %s", res2.URL.String())
+	}
+	if lb.ActiveConnections(1) != 1 {
+		t.Errorf("Expected backend 1 to have 1 active connection, got %d", lb.ActiveConnections(1))
+	}
+
+	// Complete request 1: decrement server1 active connections back to 0
+	res1.Done()
+	if lb.ActiveConnections(0) != 0 {
+		t.Errorf("Expected backend 0 active connections to be 0 after Done(), got %d", lb.ActiveConnections(0))
+	}
+
+	// Third request: server1 has 0, server2 has 1 -> must pick server1!
+	res3, err := lb.Select(nil)
+	if err != nil {
+		t.Fatalf("Select 3 failed: %v", err)
+	}
+	if res3.URL.String() != "http://server1" {
+		t.Errorf("Expected Select 3 to choose server1, got %s", res3.URL.String())
+	}
+
+	// Complete all remaining requests
+	res2.Done()
+	res3.Done()
+
+	if lb.ActiveConnections(0) != 0 || lb.ActiveConnections(1) != 0 {
+		t.Errorf("Expected active connections to return to 0, got %d and %d",
+			lb.ActiveConnections(0), lb.ActiveConnections(1))
+	}
+}
+
+func TestLeastConnectionsHealthAware(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://server1"},
+		{URL: "http://server2"},
+	}
+
+	lb, err := New(backends, WithAlgorithm(config.AlgorithmLeastConn))
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	// Hold 5 connections on server2
+	for i := 0; i < 5; i++ {
+		lb.backends[1].activeConnections.Add(1)
+	}
+
+	// Mark server1 unhealthy
+	lb.MarkHealthy(0, false)
+
+	// Even though server2 has 5 active connections and server1 has 0, server1 is unhealthy
+	// so least_conn must route to server2!
+	res, err := lb.Select(nil)
+	if err != nil {
+		t.Fatalf("Select failed: %v", err)
+	}
+	if res.URL.String() != "http://server2" {
+		t.Errorf("Expected healthy server2 to be chosen, got %s", res.URL.String())
+	}
+	res.Done()
+}
+
+func TestIPHashDeterministic(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://server1"},
+		{URL: "http://server2"},
+		{URL: "http://server3"},
+	}
+
+	lb, err := New(backends, WithAlgorithm(config.AlgorithmIPHash))
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	// Requests from the same IP must always route to the same backend
+	reqA1 := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqA1.RemoteAddr = "192.168.1.100:1234"
+
+	resA1, err := lb.Select(reqA1)
+	if err != nil {
+		t.Fatalf("Select failed: %v", err)
+	}
+
+	// Send from same IP but different port (e.g. new ephemeral port)
+	reqA2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqA2.RemoteAddr = "192.168.1.100:5678"
+
+	resA2, err := lb.Select(reqA2)
+	if err != nil {
+		t.Fatalf("Select failed: %v", err)
+	}
+
+	if resA1.URL.String() != resA2.URL.String() {
+		t.Errorf("IP Hash routed same IP to different backends: %s vs %s",
+			resA1.URL.String(), resA2.URL.String())
+	}
+
+	// Repeat 20 times for consistency
+	for i := 0; i < 20; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "192.168.1.100:9999"
+		res, err := lb.Select(req)
+		if err != nil {
+			t.Fatalf("Iteration %d failed: %v", i, err)
+		}
+		if res.URL.String() != resA1.URL.String() {
+			t.Fatalf("IP Hash was not deterministic on iteration %d: expected %s, got %s",
+				i, resA1.URL.String(), res.URL.String())
+		}
+	}
+}
+
+func TestIPHashXForwardedFor(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://server1"},
+		{URL: "http://server2"},
+	}
+
+	lb, err := New(backends, WithAlgorithm(config.AlgorithmIPHash))
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	req1 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req1.Header.Set("X-Forwarded-For", "203.0.113.195, 10.0.0.1")
+	req1.RemoteAddr = "127.0.0.1:4000"
+
+	res1, err := lb.Select(req1)
+	if err != nil {
+		t.Fatalf("Select 1 failed: %v", err)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.Header.Set("X-Forwarded-For", "203.0.113.195, 10.0.0.2")
+	req2.RemoteAddr = "127.0.0.1:5000" // different proxy hop
+
+	res2, err := lb.Select(req2)
+	if err != nil {
+		t.Fatalf("Select 2 failed: %v", err)
+	}
+
+	if res1.URL.String() != res2.URL.String() {
+		t.Errorf("Expected identical backend routing via X-Forwarded-For client IP, got %s vs %s",
+			res1.URL.String(), res2.URL.String())
+	}
+}
+
+func TestIPHashHealthFailover(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://server1"},
+		{URL: "http://server2"},
+	}
+
+	lb, err := New(backends, WithAlgorithm(config.AlgorithmIPHash))
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.0.0.5:1234"
+
+	res, err := lb.Select(req)
+	if err != nil {
+		t.Fatalf("Initial select failed: %v", err)
+	}
+
+	chosenURL := res.URL.String()
+	chosenIdx := 0
+	otherIdx := 1
+	if chosenURL == "http://server2" {
+		chosenIdx = 1
+		otherIdx = 0
+	}
+
+	// Mark chosen server unhealthy
+	lb.MarkHealthy(chosenIdx, false)
+
+	// Next select must route to other server
+	resAfterFail, err := lb.Select(req)
+	if err != nil {
+		t.Fatalf("Failover select failed: %v", err)
+	}
+	expectedOtherURL := lb.BackendURL(otherIdx).String()
+	if resAfterFail.URL.String() != expectedOtherURL {
+		t.Errorf("Expected failover to %s, got %s", expectedOtherURL, resAfterFail.URL.String())
+	}
+
+	// Recover original server
+	lb.MarkHealthy(chosenIdx, true)
+	resAfterRecovery, err := lb.Select(req)
+	if err != nil {
+		t.Fatalf("Recovery select failed: %v", err)
+	}
+	if resAfterRecovery.URL.String() != chosenURL {
+		t.Errorf("Expected return to originally hashed backend %s, got %s",
+			chosenURL, resAfterRecovery.URL.String())
+	}
+}
+
+func TestStickySessionsCookieLifecycle(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://server1"},
+		{URL: "http://server2"},
+	}
+
+	lb, err := New(backends,
+		WithAlgorithm(config.AlgorithmSticky),
+		WithCookieName("MY_COOKIE"),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	// 1. Initial request without cookie
+	req1 := httptest.NewRequest(http.MethodGet, "/", nil)
+	res1, err := lb.Select(req1)
+	if err != nil {
+		t.Fatalf("First request failed: %v", err)
+	}
+
+	if res1.Cookie == nil {
+		t.Fatal("Expected Cookie to be generated on initial request")
+	}
+	if res1.Cookie.Name != "MY_COOKIE" {
+		t.Errorf("Expected cookie name 'MY_COOKIE', got %q", res1.Cookie.Name)
+	}
+	if res1.Cookie.Value == "" {
+		t.Errorf("Expected non-empty cookie value")
+	}
+
+	assignedBackendURL := res1.URL.String()
+	sessionCookie := res1.Cookie
+
+	// 2. Subsequent requests carrying the cookie must stay on the same backend
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.AddCookie(sessionCookie)
+
+		res, err := lb.Select(req)
+		if err != nil {
+			t.Fatalf("Sticky request %d failed: %v", i, err)
+		}
+		if res.URL.String() != assignedBackendURL {
+			t.Errorf("Request %d drifted to %s, expected sticky %s",
+				i, res.URL.String(), assignedBackendURL)
+		}
+		if res.Cookie != nil {
+			t.Errorf("Request %d: Cookie should not be re-set when already valid", i)
+		}
+	}
+
+	// 3. Failover: Mark assigned backend unhealthy
+	assignedIdx := 0
+	otherIdx := 1
+	if assignedBackendURL == "http://server2" {
+		assignedIdx = 1
+		otherIdx = 0
+	}
+	lb.MarkHealthy(assignedIdx, false)
+
+	// Send request with original cookie — proxy must failover to other backend and issue new cookie
+	reqFailover := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqFailover.AddCookie(sessionCookie)
+
+	resFailover, err := lb.Select(reqFailover)
+	if err != nil {
+		t.Fatalf("Failover request failed: %v", err)
+	}
+
+	expectedOtherURL := lb.BackendURL(otherIdx).String()
+	if resFailover.URL.String() != expectedOtherURL {
+		t.Errorf("Expected failover to %s, got %s", expectedOtherURL, resFailover.URL.String())
+	}
+	if resFailover.Cookie == nil {
+		t.Fatal("Expected updated Cookie to be set on failover")
+	}
+	if resFailover.Cookie.Value == sessionCookie.Value {
+		t.Errorf("Expected new cookie value for new backend, got same %s", resFailover.Cookie.Value)
+	}
+
+	// 4. Subsequent requests with new cookie stay on failover backend
+	newCookie := resFailover.Cookie
+	reqSubsequent := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqSubsequent.AddCookie(newCookie)
+
+	resSubsequent, err := lb.Select(reqSubsequent)
+	if err != nil {
+		t.Fatalf("Subsequent request failed: %v", err)
+	}
+	if resSubsequent.URL.String() != expectedOtherURL {
+		t.Errorf("Expected stickiness to new backend %s, got %s", expectedOtherURL, resSubsequent.URL.String())
+	}
+}
+
+func TestAllAlgorithmsAllUnhealthy(t *testing.T) {
+	algos := []string{
+		config.AlgorithmRoundRobin,
+		config.AlgorithmWeightedRoundRobin,
+		config.AlgorithmLeastConn,
+		config.AlgorithmIPHash,
+		config.AlgorithmSticky,
+	}
+
+	for _, algo := range algos {
+		t.Run(algo, func(t *testing.T) {
+			backends := []config.Backend{
+				{URL: "http://server1", Weight: 2},
+				{URL: "http://server2", Weight: 1},
+			}
+
+			lb, err := New(backends, WithAlgorithm(algo))
+			if err != nil {
+				t.Fatalf("Failed to create load balancer: %v", err)
+			}
+
+			lb.MarkHealthy(0, false)
+			lb.MarkHealthy(1, false)
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			_, err = lb.Select(req)
+			if !errors.Is(err, ErrNoHealthyBackend) {
+				t.Errorf("Expected ErrNoHealthyBackend for algo %s, got %v", algo, err)
+			}
+		})
 	}
 }

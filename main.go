@@ -82,13 +82,16 @@ func main() {
 
 // backendStatus is the JSON shape returned by /healthz.
 type backendStatus struct {
-	URL     string `json:"url"`
-	Healthy bool   `json:"healthy"`
+	URL               string `json:"url"`
+	Healthy           bool   `json:"healthy"`
+	Weight            int    `json:"weight,omitempty"`
+	ActiveConnections int64  `json:"active_connections,omitempty"`
 }
 
 type routeStatus struct {
-	Path     string          `json:"path"`
-	Backends []backendStatus `json:"backends"`
+	Path      string          `json:"path"`
+	Algorithm string          `json:"algorithm,omitempty"`
+	Backends  []backendStatus `json:"backends"`
 }
 
 // makeHealthzHandler returns an HTTP handler that reports the health of every
@@ -106,11 +109,17 @@ func makeHealthzHandler(r *router.Router) http.HandlerFunc {
 					allHealthy = false
 				}
 				bs = append(bs, backendStatus{
-					URL:     entry.LB.BackendURL(i).String(),
-					Healthy: healthy,
+					URL:               entry.LB.BackendURL(i).String(),
+					Healthy:           healthy,
+					Weight:            entry.LB.Weight(i),
+					ActiveConnections: entry.LB.ActiveConnections(i),
 				})
 			}
-			routes = append(routes, routeStatus{Path: entry.Path, Backends: bs})
+			routes = append(routes, routeStatus{
+				Path:      entry.Path,
+				Algorithm: entry.LB.Algorithm(),
+				Backends:  bs,
+			})
 		}
 
 		w.Header().Set("Content-Type", "application/json")

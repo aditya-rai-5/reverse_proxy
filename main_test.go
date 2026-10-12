@@ -88,3 +88,64 @@ func TestHealthzHandlerDegraded(t *testing.T) {
 		t.Errorf("Expected status 'degraded', got %v", data["status"])
 	}
 }
+
+func TestHealthzHandlerAlgorithmAndWeight(t *testing.T) {
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:      "/heavy",
+				Algorithm: "weighted_round_robin",
+				Backends: []config.Backend{
+					{URL: "http://localhost:9001", Weight: 2},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := makeHealthzHandler(r)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	var data struct {
+		Status string `json:"status"`
+		Routes []struct {
+			Path      string `json:"path"`
+			Algorithm string `json:"algorithm"`
+			Backends  []struct {
+				URL               string `json:"url"`
+				Healthy           bool   `json:"healthy"`
+				Weight            int    `json:"weight"`
+				ActiveConnections int64  `json:"active_connections"`
+			} `json:"backends"`
+		} `json:"routes"`
+	}
+
+	if err := json.NewDecoder(rec.Body).Decode(&data); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if data.Status != "healthy" {
+		t.Errorf("Expected status 'healthy', got %v", data.Status)
+	}
+	if len(data.Routes) != 1 {
+		t.Fatalf("Expected 1 route, got %d", len(data.Routes))
+	}
+	if data.Routes[0].Algorithm != config.AlgorithmWeightedRoundRobin {
+		t.Errorf("Expected algorithm %q, got %q", config.AlgorithmWeightedRoundRobin, data.Routes[0].Algorithm)
+	}
+	if len(data.Routes[0].Backends) != 1 {
+		t.Fatalf("Expected 1 backend, got %d", len(data.Routes[0].Backends))
+	}
+	if data.Routes[0].Backends[0].Weight != 2 {
+		t.Errorf("Expected backend weight 2, got %d", data.Routes[0].Backends[0].Weight)
+	}
+}

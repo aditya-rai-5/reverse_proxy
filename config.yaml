@@ -6,14 +6,40 @@ health_check:
   timeout: 5s
 
 routes:
-  # Path stripping example: /api/users -> forwarded as /users
+  # Weighted Round-Robin: beefier backend (weight 2) takes 2x traffic
   - path: "/api"
     strip_prefix: "/api"
+    algorithm: "weighted_round_robin"
     backends:
       - url: "http://localhost:9001"
+        weight: 2
       - url: "http://localhost:9002"
+        weight: 1
 
-  # Fallback root route
+  # Least Connections: routes to backend with least in-flight requests
+  - path: "/compute"
+    algorithm: "least_conn"
+    backends:
+      - url: "http://localhost:9003"
+      - url: "http://localhost:9004"
+
+  # Sticky Sessions: uses session cookie to keep subsequent requests on the same backend
+  - path: "/app"
+    algorithm: "sticky"
+    cookie_name: "SERVERID"
+    backends:
+      - url: "http://localhost:9005"
+      - url: "http://localhost:9006"
+
+  # IP Hash: hashes client IP to deterministically pin user requests
+  - path: "/ip"
+    algorithm: "ip_hash"
+    backends:
+      - url: "http://localhost:9007"
+      - url: "http://localhost:9008"
+
+  # Fallback root route (defaults to round-robin)
   - path: "/"
+    algorithm: "round_robin"
     backends:
       - url: "http://localhost:9000"

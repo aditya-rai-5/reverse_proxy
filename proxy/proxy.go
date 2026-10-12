@@ -28,7 +28,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := entry.Next()
+	result, err := entry.Select(r)
 	if err != nil {
 		if errors.Is(err, loadbalancer.ErrNoHealthyBackend) {
 			log.Printf("[PROXY] all backends unhealthy for %s", r.URL.Path)
@@ -39,7 +39,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
 		return
 	}
+	if result.Done != nil {
+		defer result.Done()
+	}
+	if result.Cookie != nil {
+		http.SetCookie(w, result.Cookie)
+	}
 
+	target := result.URL
 	rewrittenPath := entry.RewritePath(r.URL.Path)
 
 	proxy := &httputil.ReverseProxy{

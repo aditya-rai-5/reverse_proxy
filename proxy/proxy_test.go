@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aditya-rai-5/reverse_proxy/config"
 	"github.com/aditya-rai-5/reverse_proxy/router"
@@ -360,5 +363,288 @@ func TestProxyRoundRobin(t *testing.T) {
 	}
 	if count2.Load() != 2 {
 		t.Errorf("Expected backend2 to receive 2 requests, got %d", count2.Load())
+	}
+}
+
+func TestProxyWeightedRoundRobin(t *testing.T) {
+	var count1, count2 atomic.Int64
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count1.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count2.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend2.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:      "/weighted",
+				Algorithm: "weighted_round_robin",
+				Backends: []config.Backend{
+					{URL: backend1.URL, Weight: 2},
+					{URL: backend2.URL, Weight: 1},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	// Send 6 requests: expected ratio 2:1 -> 4 to backend1, 2 to backend2
+	for i := 0; i < 6; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/weighted", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Request %d failed with status %d", i, rec.Code)
+		}
+	}
+
+	if count1.Load() != 4 {
+		t.Errorf("Expected backend1 to receive 4 requests, got %d", count1.Load())
+	}
+	if count2.Load() != 2 {
+		t.Errorf("Expected backend2 to receive 2 requests, got %d", count2.Load())
+	}
+}
+
+func TestProxyLeastConnections(t *testing.T) {
+	var count1, count2 atomic.Int64
+	started1 := make(chan struct{})
+	unblock1 := make(chan struct{})
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count1.Add(1)
+		close(started1)
+		<-unblock1 // hold request open until signaled
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count2.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend2.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:      "/api",
+				Algorithm: "least_conn",
+				Backends: []config.Backend{
+					{URL: backend1.URL},
+					{URL: backend2.URL},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	// Launch first request asynchronously; it hits backend1 and stays in-flight
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest(http.MethodGet, "/api/task1", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+	}()
+
+	// Wait until backend1 is actively processing request 1
+	select {
+	case <-started1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timed out waiting for backend1 to start processing")
+	}
+
+	// While request 1 is in-flight on backend1, send request 2
+	// Least connections MUST route to backend2 (0 in flight) rather than backend1 (1 in flight)
+	req2 := httptest.NewRequest(http.MethodGet, "/api/task2", nil)
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Errorf("Request 2 failed with code %d", rec2.Code)
+	}
+
+	if count2.Load() != 1 {
+		t.Errorf("Expected backend2 to handle concurrent request, got %d", count2.Load())
+	}
+
+	// Unblock backend1 and wait for first request to complete
+	close(unblock1)
+	wg.Wait()
+
+	if count1.Load() != 1 {
+		t.Errorf("Expected backend1 to handle 1 request, got %d", count1.Load())
+	}
+}
+
+func TestProxyStickySessions(t *testing.T) {
+	var count1, count2 atomic.Int64
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count1.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("b1"))
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count2.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("b2"))
+	}))
+	defer backend2.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:       "/app",
+				Algorithm:  "sticky",
+				CookieName: "SERVERID",
+				Backends: []config.Backend{
+					{URL: backend1.URL},
+					{URL: backend2.URL},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	// 1. Initial request without cookie
+	req1 := httptest.NewRequest(http.MethodGet, "/app/login", nil)
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("Initial request failed with status %d", rec1.Code)
+	}
+
+	// Should have Set-Cookie header
+	cookies := rec1.Result().Cookies()
+	var serverCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == "SERVERID" {
+			serverCookie = c
+			break
+		}
+	}
+	if serverCookie == nil {
+		t.Fatal("Expected Set-Cookie: SERVERID in response")
+	}
+
+	b1First := count1.Load() == 1
+
+	// 2. Subsequent 5 requests carrying the session cookie
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/app/profile", nil)
+		req.AddCookie(serverCookie)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Subsequent request %d failed: %d", i, rec.Code)
+		}
+	}
+
+	if b1First {
+		// All 6 requests should have gone to backend1
+		if count1.Load() != 6 {
+			t.Errorf("Expected backend1 to receive all 6 requests, got %d", count1.Load())
+		}
+		if count2.Load() != 0 {
+			t.Errorf("Expected backend2 to receive 0 requests, got %d", count2.Load())
+		}
+	} else {
+		// All 6 requests should have gone to backend2
+		if count2.Load() != 6 {
+			t.Errorf("Expected backend2 to receive all 6 requests, got %d", count2.Load())
+		}
+		if count1.Load() != 0 {
+			t.Errorf("Expected backend1 to receive 0 requests, got %d", count1.Load())
+		}
+	}
+}
+
+func TestProxyIPHash(t *testing.T) {
+	var count1, count2 atomic.Int64
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count1.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count2.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend2.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:      "/ip-test",
+				Algorithm: "ip_hash",
+				Backends: []config.Backend{
+					{URL: backend1.URL},
+					{URL: backend2.URL},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	// Client IP 192.168.1.100 sends 5 requests with differing source ports
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/ip-test", nil)
+		req.RemoteAddr = fmt.Sprintf("192.168.1.100:%d", 10000+i)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Request %d failed", i)
+		}
+	}
+
+	// Either backend1 got 5 or backend2 got 5 (all pinned)
+	c1 := count1.Load()
+	c2 := count2.Load()
+	if !((c1 == 5 && c2 == 0) || (c1 == 0 && c2 == 5)) {
+		t.Errorf("Expected IP hash to pin all requests to one backend, got c1=%d, c2=%d", c1, c2)
 	}
 }

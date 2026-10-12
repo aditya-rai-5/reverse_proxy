@@ -2,6 +2,7 @@ package router
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
@@ -22,6 +23,11 @@ type Entry struct {
 // Next selects the next healthy backend from the entry's load balancer.
 func (e *Entry) Next() (*url.URL, error) {
 	return e.LB.Next()
+}
+
+// Select routes a request through the entry's load balancer according to its algorithm.
+func (e *Entry) Select(req *http.Request) (*loadbalancer.Result, error) {
+	return e.LB.Select(req)
 }
 
 // RewritePath applies configured prefix stripping and regex rewriting to requestPath.
@@ -56,7 +62,11 @@ func New(cfg *config.Config) (*Router, error) {
 	entries := make([]Entry, 0, len(cfg.Routes))
 
 	for _, route := range cfg.Routes {
-		lb, err := loadbalancer.New(route.Backends)
+		lb, err := loadbalancer.New(
+			route.Backends,
+			loadbalancer.WithAlgorithm(route.Algorithm),
+			loadbalancer.WithCookieName(route.CookieName),
+		)
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", route.Path, err)
 		}

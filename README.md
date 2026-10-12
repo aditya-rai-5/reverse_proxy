@@ -6,11 +6,16 @@ A fast, production-style HTTP reverse proxy with path-based routing, path stripp
 
 - **Path-Based Routing:** Longest-prefix matching route resolution with boundary protection (e.g. `/api` won't mistakenly match `/apikeys`).
 - **Path Stripping & Rewriting:** Strip prefixes (`strip_prefix: "/api"`) or rewrite paths via regex (`rewrite: { pattern: "^/legacy/(.*)$", replacement: "/v2/$1" }`) before forwarding upstream.
-- **Round-Robin Load Balancing:** Thread-safe, lock-free backend distribution via atomic operations.
+- **Advanced Load Balancing Algorithms:**
+  - **Round-Robin (`round_robin`):** Lock-free, atomic round-robin request distribution.
+  - **Weighted Round-Robin (`weighted_round_robin`):** Smooth Weighted Round-Robin (Nginx algorithm) distributing traffic according to server weights (e.g., `weight: 2`).
+  - **Least Connections (`least_conn`):** Real-time tracking of active in-flight requests per backend, routing each request to the least busy healthy server.
+  - **IP Hash (`ip_hash`):** Deterministic hashing of client IP (from `RemoteAddr` or `X-Forwarded-For`), pinning clients to backends with automatic failover.
+  - **Sticky Sessions (`sticky`):** Cookie-based session persistence (configurable `cookie_name`) ensuring subsequent user requests stay on the same backend, with automatic health failover.
 - **Active Health Checks:** Periodic background HTTP probing of all upstream backends with automatic failure detection and recovery.
-- **Failover & Fault Tolerance:** Dead backends are automatically skipped; returns HTTP `503 Service Unavailable` if all backends are down.
+- **Failover & Fault Tolerance:** Dead backends are automatically skipped across all load balancing algorithms; returns HTTP `503 Service Unavailable` if all backends are down.
 - **Header Forwarding:** Automatically preserves and forwards `X-Forwarded-For` and `X-Forwarded-Host`.
-- **Healthz Endpoint:** Exposes `GET /healthz` returning JSON status of all backends and routes.
+- **Healthz Endpoint:** Exposes `GET /healthz` returning JSON status of all backends (including health status, weight, active in-flight connections, and route algorithm).
 - **Graceful Shutdown:** Catches `SIGINT`/`SIGTERM` and drains in-flight requests with a 10-second timeout.
 
 ## Configuration
@@ -26,23 +31,41 @@ health_check:
   timeout: 5s
 
 routes:
-  # Path stripping: incoming /api/users is forwarded to backend as /users
+  # Weighted Round-Robin: beefier backend (weight 2) takes 2x traffic
   - path: "/api"
     strip_prefix: "/api"
+    algorithm: "weighted_round_robin"
     backends:
       - url: "http://localhost:9001"
+        weight: 2
       - url: "http://localhost:9002"
+        weight: 1
 
-  # Path rewriting: incoming /legacy/orders is forwarded to backend as /v2/orders
-  - path: "/legacy"
-    rewrite:
-      pattern: "^/legacy/(.*)$"
-      replacement: "/v2/$1"
+  # Least Connections: routes to backend with least in-flight requests
+  - path: "/compute"
+    algorithm: "least_conn"
     backends:
       - url: "http://localhost:9003"
+      - url: "http://localhost:9004"
 
-  # Fallback root route
+  # Sticky Sessions: uses session cookie to keep subsequent requests on the same backend
+  - path: "/app"
+    algorithm: "sticky"
+    cookie_name: "SERVERID"
+    backends:
+      - url: "http://localhost:9005"
+      - url: "http://localhost:9006"
+
+  # IP Hash: hashes client IP to deterministically pin user requests
+  - path: "/ip"
+    algorithm: "ip_hash"
+    backends:
+      - url: "http://localhost:9007"
+      - url: "http://localhost:9008"
+
+  # Fallback root route (defaults to round-robin)
   - path: "/"
+    algorithm: "round_robin"
     backends:
       - url: "http://localhost:9000"
 ```

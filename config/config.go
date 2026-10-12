@@ -10,8 +10,35 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	AlgorithmRoundRobin         = "round_robin"
+	AlgorithmWeightedRoundRobin = "weighted_round_robin"
+	AlgorithmLeastConn          = "least_conn"
+	AlgorithmIPHash             = "ip_hash"
+	AlgorithmSticky             = "sticky"
+)
+
+// NormalizeAlgorithm standardizes algorithm names and aliases.
+func NormalizeAlgorithm(algo string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(algo)) {
+	case "", "round_robin", "round-robin", "roundrobin", "rr":
+		return AlgorithmRoundRobin, nil
+	case "weighted_round_robin", "weighted-round-robin", "weighted", "wrr":
+		return AlgorithmWeightedRoundRobin, nil
+	case "least_conn", "least-conn", "least_connections", "least-connections", "lc":
+		return AlgorithmLeastConn, nil
+	case "ip_hash", "ip-hash", "iphash":
+		return AlgorithmIPHash, nil
+	case "sticky", "sticky_session", "sticky_sessions", "sticky-session", "sticky-sessions", "cookie":
+		return AlgorithmSticky, nil
+	default:
+		return "", fmt.Errorf("unsupported load balancing algorithm %q", algo)
+	}
+}
+
 type Backend struct {
-	URL string `yaml:"url"`
+	URL    string `yaml:"url"`
+	Weight int    `yaml:"weight,omitempty"`
 }
 
 // RewriteRule defines regex pattern replacement for a route's path.
@@ -24,6 +51,8 @@ type Route struct {
 	Path        string       `yaml:"path"`
 	StripPrefix string       `yaml:"strip_prefix"`
 	Rewrite     *RewriteRule `yaml:"rewrite"`
+	Algorithm   string       `yaml:"algorithm,omitempty"`
+	CookieName  string       `yaml:"cookie_name,omitempty"`
 	Backends    []Backend    `yaml:"backends"`
 }
 
@@ -84,7 +113,8 @@ func validate(cfg *Config) error {
 	if len(cfg.Routes) == 0 {
 		return fmt.Errorf("at least one route must be defined")
 	}
-	for i, route := range cfg.Routes {
+	for i := range cfg.Routes {
+		route := &cfg.Routes[i]
 		if route.Path == "" {
 			return fmt.Errorf("route[%d]: path must not be empty", i)
 		}
@@ -102,10 +132,37 @@ func validate(cfg *Config) error {
 		if len(route.Backends) == 0 {
 			return fmt.Errorf("route[%d]: at least one backend must be defined", i)
 		}
-		for j, backend := range route.Backends {
+
+		// Normalize & validate algorithm
+		normalizedAlgo, err := NormalizeAlgorithm(route.Algorithm)
+		if err != nil {
+			return fmt.Errorf("route[%d]: %w", i, err)
+		}
+
+		hasCustomWeight := false
+		for j := range route.Backends {
+			backend := &route.Backends[j]
 			if backend.URL == "" {
 				return fmt.Errorf("route[%d].backend[%d]: url must not be empty", i, j)
 			}
+			if backend.Weight < 0 {
+				return fmt.Errorf("route[%d].backend[%d]: weight must be non-negative", i, j)
+			}
+			if backend.Weight == 0 {
+				backend.Weight = 1
+			}
+			if backend.Weight > 1 {
+				hasCustomWeight = true
+			}
+		}
+
+		if route.Algorithm == "" && hasCustomWeight {
+			normalizedAlgo = AlgorithmWeightedRoundRobin
+		}
+		route.Algorithm = normalizedAlgo
+
+		if route.Algorithm == AlgorithmSticky && route.CookieName == "" {
+			route.CookieName = "SERVERID"
 		}
 	}
 	return nil

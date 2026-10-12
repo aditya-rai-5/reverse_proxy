@@ -282,3 +282,54 @@ func TestRewritePath_NoRules(t *testing.T) {
 		t.Errorf("Expected path to remain unchanged '/api/status', got %q", rewritten)
 	}
 }
+
+func TestRouterAlgorithmConfiguration(t *testing.T) {
+	cfg := &config.Config{
+		Routes: []config.Route{
+			{
+				Path:       "/sticky",
+				Algorithm:  "sticky",
+				CookieName: "MY_COOKIE",
+				Backends:   []config.Backend{{URL: "http://srv1"}, {URL: "http://srv2"}},
+			},
+			{
+				Path:      "/weighted",
+				Algorithm: "weighted_round_robin",
+				Backends:  []config.Backend{{URL: "http://heavy", Weight: 3}, {URL: "http://light", Weight: 1}},
+			},
+		},
+	}
+
+	r, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	stickyEntry, err := r.Match("/sticky/test")
+	if err != nil {
+		t.Fatalf("Failed to match /sticky: %v", err)
+	}
+	if stickyEntry.LB.Algorithm() != config.AlgorithmSticky {
+		t.Errorf("Expected algorithm %q, got %q", config.AlgorithmSticky, stickyEntry.LB.Algorithm())
+	}
+
+	weightedEntry, err := r.Match("/weighted/test")
+	if err != nil {
+		t.Fatalf("Failed to match /weighted: %v", err)
+	}
+	if weightedEntry.LB.Algorithm() != config.AlgorithmWeightedRoundRobin {
+		t.Errorf("Expected algorithm %q, got %q", config.AlgorithmWeightedRoundRobin, weightedEntry.LB.Algorithm())
+	}
+	if weightedEntry.LB.Weight(0) != 3 || weightedEntry.LB.Weight(1) != 1 {
+		t.Errorf("Expected weights 3 and 1, got %d and %d", weightedEntry.LB.Weight(0), weightedEntry.LB.Weight(1))
+	}
+
+	// Verify entry.Select works
+	res, err := weightedEntry.Select(nil)
+	if err != nil {
+		t.Fatalf("weightedEntry.Select failed: %v", err)
+	}
+	if res.URL == nil {
+		t.Fatal("Expected non-nil URL from Select")
+	}
+}
