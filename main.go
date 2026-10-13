@@ -82,15 +82,18 @@ func main() {
 
 // backendStatus is the JSON shape returned by /healthz.
 type backendStatus struct {
-	URL               string `json:"url"`
-	Healthy           bool   `json:"healthy"`
-	Weight            int    `json:"weight,omitempty"`
-	ActiveConnections int64  `json:"active_connections,omitempty"`
+	URL                 string `json:"url"`
+	Healthy             bool   `json:"healthy"`
+	Weight              int    `json:"weight,omitempty"`
+	ActiveConnections   int64  `json:"active_connections,omitempty"`
+	CircuitBreakerState string `json:"circuit_breaker,omitempty"`
+	ConsecutiveFailures int    `json:"consecutive_failures,omitempty"`
 }
 
 type routeStatus struct {
 	Path      string          `json:"path"`
 	Algorithm string          `json:"algorithm,omitempty"`
+	Retries   int             `json:"retries,omitempty"`
 	Backends  []backendStatus `json:"backends"`
 }
 
@@ -105,19 +108,23 @@ func makeHealthzHandler(r *router.Router) http.HandlerFunc {
 			var bs []backendStatus
 			for i := 0; i < entry.LB.Len(); i++ {
 				healthy := entry.LB.IsHealthy(i)
-				if !healthy {
+				cbState := string(entry.LB.CircuitBreakerState(i))
+				if !healthy || cbState == "open" {
 					allHealthy = false
 				}
 				bs = append(bs, backendStatus{
-					URL:               entry.LB.BackendURL(i).String(),
-					Healthy:           healthy,
-					Weight:            entry.LB.Weight(i),
-					ActiveConnections: entry.LB.ActiveConnections(i),
+					URL:                 entry.LB.BackendURL(i).String(),
+					Healthy:             healthy,
+					Weight:              entry.LB.Weight(i),
+					ActiveConnections:   entry.LB.ActiveConnections(i),
+					CircuitBreakerState: cbState,
+					ConsecutiveFailures: entry.LB.ConsecutiveFailures(i),
 				})
 			}
 			routes = append(routes, routeStatus{
 				Path:      entry.Path,
 				Algorithm: entry.LB.Algorithm(),
+				Retries:   entry.Retries,
 				Backends:  bs,
 			})
 		}

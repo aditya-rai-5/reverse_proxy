@@ -558,10 +558,8 @@ func TestIPHashHealthFailover(t *testing.T) {
 		otherIdx = 0
 	}
 
-	// Mark chosen server unhealthy
 	lb.MarkHealthy(chosenIdx, false)
 
-	// Next select must route to other server
 	resAfterFail, err := lb.Select(req)
 	if err != nil {
 		t.Fatalf("Failover select failed: %v", err)
@@ -571,7 +569,6 @@ func TestIPHashHealthFailover(t *testing.T) {
 		t.Errorf("Expected failover to %s, got %s", expectedOtherURL, resAfterFail.URL.String())
 	}
 
-	// Recover original server
 	lb.MarkHealthy(chosenIdx, true)
 	resAfterRecovery, err := lb.Select(req)
 	if err != nil {
@@ -597,7 +594,6 @@ func TestStickySessionsCookieLifecycle(t *testing.T) {
 		t.Fatalf("Failed to create load balancer: %v", err)
 	}
 
-	// 1. Initial request without cookie
 	req1 := httptest.NewRequest(http.MethodGet, "/", nil)
 	res1, err := lb.Select(req1)
 	if err != nil {
@@ -617,7 +613,6 @@ func TestStickySessionsCookieLifecycle(t *testing.T) {
 	assignedBackendURL := res1.URL.String()
 	sessionCookie := res1.Cookie
 
-	// 2. Subsequent requests carrying the cookie must stay on the same backend
 	for i := 0; i < 5; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.AddCookie(sessionCookie)
@@ -635,7 +630,6 @@ func TestStickySessionsCookieLifecycle(t *testing.T) {
 		}
 	}
 
-	// 3. Failover: Mark assigned backend unhealthy
 	assignedIdx := 0
 	otherIdx := 1
 	if assignedBackendURL == "http://server2" {
@@ -644,7 +638,6 @@ func TestStickySessionsCookieLifecycle(t *testing.T) {
 	}
 	lb.MarkHealthy(assignedIdx, false)
 
-	// Send request with original cookie — proxy must failover to other backend and issue new cookie
 	reqFailover := httptest.NewRequest(http.MethodGet, "/", nil)
 	reqFailover.AddCookie(sessionCookie)
 
@@ -664,7 +657,6 @@ func TestStickySessionsCookieLifecycle(t *testing.T) {
 		t.Errorf("Expected new cookie value for new backend, got same %s", resFailover.Cookie.Value)
 	}
 
-	// 4. Subsequent requests with new cookie stay on failover backend
 	newCookie := resFailover.Cookie
 	reqSubsequent := httptest.NewRequest(http.MethodGet, "/", nil)
 	reqSubsequent.AddCookie(newCookie)
@@ -708,5 +700,79 @@ func TestAllAlgorithmsAllUnhealthy(t *testing.T) {
 				t.Errorf("Expected ErrNoHealthyBackend for algo %s, got %v", algo, err)
 			}
 		})
+	}
+}
+
+func TestCircuitBreakerTripsAfter5ConsecutiveFailures(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://server1"},
+		{URL: "http://server2"},
+	}
+
+	lb, err := New(backends)
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	server1URL := lb.BackendURL(0)
+
+	for i := 1; i <= 4; i++ {
+		lb.RecordFailure(server1URL)
+		if lb.ConsecutiveFailures(0) != i {
+			t.Errorf("Expected %d failures, got %d", i, lb.ConsecutiveFailures(0))
+		}
+		if lb.CircuitBreakerState(0) != "closed" {
+			t.Errorf("Expected closed state, got %s", lb.CircuitBreakerState(0))
+		}
+	}
+
+	lb.RecordFailure(server1URL)
+	if lb.CircuitBreakerState(0) != "open" {
+		t.Fatalf("Expected open state after 5 failures, got %s", lb.CircuitBreakerState(0))
+	}
+
+	for i := 0; i < 5; i++ {
+		res, err := lb.Select(nil)
+		if err != nil {
+			t.Fatalf("Select %d failed: %v", i, err)
+		}
+		if res.URL.String() != "http://server2" {
+			t.Errorf("Expected server2 to be selected because server1 is tripped, got %s", res.URL.String())
+		}
+	}
+
+	lb.RecordSuccess(server1URL)
+	if lb.CircuitBreakerState(0) != "closed" {
+		t.Errorf("Expected closed state after success, got %s", lb.CircuitBreakerState(0))
+	}
+	if lb.ConsecutiveFailures(0) != 0 {
+		t.Errorf("Expected 0 failures after success, got %d", lb.ConsecutiveFailures(0))
+	}
+}
+
+func TestSelectExcluding(t *testing.T) {
+	backends := []config.Backend{
+		{URL: "http://server1"},
+		{URL: "http://server2"},
+	}
+
+	lb, err := New(backends)
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+
+	excluded := map[string]bool{"http://server1": true}
+	res, err := lb.SelectExcluding(nil, excluded)
+	if err != nil {
+		t.Fatalf("SelectExcluding failed: %v", err)
+	}
+	if res.URL.String() != "http://server2" {
+		t.Errorf("Expected server2 when server1 is excluded, got %s", res.URL.String())
+	}
+
+	excluded["http://server2"] = true
+	_, err = lb.SelectExcluding(nil, excluded)
+	if !errors.Is(err, ErrNoHealthyBackend) {
+		t.Errorf("Expected ErrNoHealthyBackend when all backends excluded, got %v", err)
 	}
 }

@@ -648,3 +648,313 @@ func TestProxyIPHash(t *testing.T) {
 		t.Errorf("Expected IP hash to pin all requests to one backend, got c1=%d, c2=%d", c1, c2)
 	}
 }
+
+func TestProxyRetryOn502(t *testing.T) {
+	var count1, count2 atomic.Int64
+
+	// Backend 1 returns 502 Bad Gateway
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count1.Add(1)
+		http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
+	}))
+	defer backend1.Close()
+
+	// Backend 2 succeeds with 200 OK
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count2.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("recovered by backend 2"))
+	}))
+	defer backend2.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:    "/retry-502",
+				Retries: 2,
+				Backends: []config.Backend{
+					{URL: backend1.URL},
+					{URL: backend2.URL},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	req := httptest.NewRequest(http.MethodGet, "/retry-502", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Client must receive HTTP 200 from backend 2
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", rec.Code)
+	}
+
+	body, _ := io.ReadAll(rec.Body)
+	if string(body) != "recovered by backend 2" {
+		t.Errorf("Expected body 'recovered by backend 2', got %q", string(body))
+	}
+
+	// Backend 1 failed, Backend 2 handled the retry
+	if count1.Load() != 1 {
+		t.Errorf("Expected backend 1 to be called once, got %d", count1.Load())
+	}
+	if count2.Load() != 1 {
+		t.Errorf("Expected backend 2 to handle retry, got %d", count2.Load())
+	}
+}
+
+func TestProxyRetryOnDialFailure(t *testing.T) {
+	var count2 atomic.Int64
+
+	// Closed backend immediately triggers dial failure
+	closedBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	closedURL := closedBackend.URL
+	closedBackend.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count2.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("healthy backend"))
+	}))
+	defer backend2.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:    "/dial-retry",
+				Retries: 1,
+				Backends: []config.Backend{
+					{URL: closedURL},
+					{URL: backend2.URL},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	req := httptest.NewRequest(http.MethodGet, "/dial-retry", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected status 200 from retry, got %d", rec.Code)
+	}
+
+	if count2.Load() != 1 {
+		t.Errorf("Expected backend 2 to handle retry, got %d", count2.Load())
+	}
+}
+
+func TestProxyRetryWithRequestBody(t *testing.T) {
+	var receivedBody string
+
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Read body to simulate consuming stream, then fail
+		_, _ = io.ReadAll(r.Body)
+		http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
+	}))
+	defer backend1.Close()
+
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		receivedBody = string(b)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("accepted"))
+	}))
+	defer backend2.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:    "/api/upload",
+				Retries: 1,
+				Backends: []config.Backend{
+					{URL: backend1.URL},
+					{URL: backend2.URL},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	payload := `{"username":"alice","action":"create"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/upload", strings.NewReader(payload))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", rec.Code)
+	}
+
+	if receivedBody != payload {
+		t.Errorf("Expected backend 2 to receive payload %q, got %q", payload, receivedBody)
+	}
+}
+
+func TestProxyCircuitBreakerTripsAndSkips(t *testing.T) {
+	var count1, count2 atomic.Int64
+
+	// Backend 1 always returns 502
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count1.Add(1)
+		http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
+	}))
+	defer backend1.Close()
+
+	// Backend 2 succeeds
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count2.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend2.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:    "/cb-test",
+				Retries: 1,
+				CircuitBreaker: &config.CircuitBreakerConfig{
+					FailureThreshold: 5,
+					Cooldown:         10 * time.Second,
+				},
+				Backends: []config.Backend{
+					{URL: backend1.URL},
+					{URL: backend2.URL},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	// Send 5 requests: each one attempts backend 1, fails with 502, then retries backend 2
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/cb-test", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Request %d failed with code %d", i+1, rec.Code)
+		}
+	}
+
+	if count1.Load() != 5 {
+		t.Errorf("Expected backend 1 to fail 5 times, got %d", count1.Load())
+	}
+	if count2.Load() != 5 {
+		t.Errorf("Expected backend 2 to handle 5 retries, got %d", count2.Load())
+	}
+
+	// Backend 1's circuit breaker should now be OPEN!
+	entries := r.Entries()
+	if len(entries) != 1 {
+		t.Fatal("Expected 1 route entry")
+	}
+	if entries[0].LB.CircuitBreakerState(0) != "open" {
+		t.Errorf("Expected backend 1 circuit breaker to be open, got %s", entries[0].LB.CircuitBreakerState(0))
+	}
+
+	// 6th request: backend 1 must be SKIPPED completely!
+	req6 := httptest.NewRequest(http.MethodGet, "/cb-test", nil)
+	rec6 := httptest.NewRecorder()
+	handler.ServeHTTP(rec6, req6)
+
+	if rec6.Code != http.StatusOK {
+		t.Fatalf("Request 6 failed with code %d", rec6.Code)
+	}
+
+	// count1 must STILL be 5 (backend 1 was skipped without sending traffic)
+	if count1.Load() != 5 {
+		t.Errorf("Expected backend 1 count to remain 5 (skipped), got %d", count1.Load())
+	}
+	// count2 must be 6 (handled request directly without waiting on backend 1)
+	if count2.Load() != 6 {
+		t.Errorf("Expected backend 2 count to be 6, got %d", count2.Load())
+	}
+}
+
+func TestProxyTimeoutPerAttempt(t *testing.T) {
+	var count1, count2 atomic.Int64
+
+	// Backend 1 takes 100ms to respond
+	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count1.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend1.Close()
+
+	// Backend 2 responds immediately
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count2.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("fast backend"))
+	}))
+	defer backend2.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path:    "/timeout-retry",
+				Retries: 1,
+				Timeout: 25 * time.Millisecond, // 25ms timeout causes backend 1 (100ms) to time out
+				Backends: []config.Backend{
+					{URL: backend1.URL},
+					{URL: backend2.URL},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	req := httptest.NewRequest(http.MethodGet, "/timeout-retry", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", rec.Code)
+	}
+
+	body, _ := io.ReadAll(rec.Body)
+	if string(body) != "fast backend" {
+		t.Errorf("Expected 'fast backend', got %q", string(body))
+	}
+
+	if count2.Load() != 1 {
+		t.Errorf("Expected backend 2 to handle retry after timeout, got %d", count2.Load())
+	}
+}

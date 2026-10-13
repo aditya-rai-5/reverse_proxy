@@ -47,23 +47,39 @@ type RewriteRule struct {
 	Replacement string `yaml:"replacement"`
 }
 
+// CircuitBreakerConfig holds settings for backend failure detection and recovery.
+type CircuitBreakerConfig struct {
+	FailureThreshold int `yaml:"failure_threshold"`
+	Cooldown           time.Duration `yaml:"cooldown"`
+}
+
+// Defaults fills in zero-value fields with sensible defaults.
+func (cb *CircuitBreakerConfig) Defaults() {
+	if cb.FailureThreshold <= 0 {
+		cb.FailureThreshold = 5
+	}
+	if cb.Cooldown <= 0 {
+		cb.Cooldown = 10 * time.Second
+	}
+}
+
 type Route struct {
-	Path        string       `yaml:"path"`
-	StripPrefix string       `yaml:"strip_prefix"`
-	Rewrite     *RewriteRule `yaml:"rewrite"`
-	Algorithm   string       `yaml:"algorithm,omitempty"`
-	CookieName  string       `yaml:"cookie_name,omitempty"`
-	Backends    []Backend    `yaml:"backends"`
+	Path           string                `yaml:"path"`
+	StripPrefix    string                `yaml:"strip_prefix"`
+	Rewrite        *RewriteRule          `yaml:"rewrite"`
+	Algorithm      string                `yaml:"algorithm,omitempty"`
+	CookieName     string                `yaml:"cookie_name,omitempty"`
+	Retries        int                   `yaml:"retries,omitempty"`
+	Timeout        time.Duration         `yaml:"timeout,omitempty"`
+	CircuitBreaker *CircuitBreakerConfig `yaml:"circuit_breaker,omitempty"`
+	Backends       []Backend             `yaml:"backends"`
 }
 
 // HealthCheck holds configuration for backend health probing.
 type HealthCheck struct {
-	// Path is the HTTP path to probe on each backend (default: "/health").
-	Path string `yaml:"path"`
-	// Interval is how often to probe each backend (default: 10s).
+	Path     string `yaml:"path"`
 	Interval time.Duration `yaml:"interval"`
-	// Timeout is the maximum time to wait for a probe response (default: 5s).
-	Timeout time.Duration `yaml:"timeout"`
+	Timeout  time.Duration `yaml:"timeout"`
 }
 
 // defaults fills in zero-value fields with sensible defaults.
@@ -164,6 +180,25 @@ func validate(cfg *Config) error {
 		if route.Algorithm == AlgorithmSticky && route.CookieName == "" {
 			route.CookieName = "SERVERID"
 		}
+
+		if route.Retries < 0 {
+			return fmt.Errorf("route[%d]: retries must be non-negative", i)
+		}
+		if route.Retries == 0 && len(route.Backends) > 1 {
+			route.Retries = len(route.Backends) - 1
+			if route.Retries > 2 {
+				route.Retries = 2
+			}
+		}
+
+		if route.Timeout < 0 {
+			return fmt.Errorf("route[%d]: timeout must be non-negative", i)
+		}
+
+		if route.CircuitBreaker == nil {
+			route.CircuitBreaker = &CircuitBreakerConfig{}
+		}
+		route.CircuitBreaker.Defaults()
 	}
 	return nil
 }

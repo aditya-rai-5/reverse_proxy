@@ -282,6 +282,34 @@ func TestValidate(t *testing.T) {
 			},
 			expectError: false,
 		},
+		{
+			name: "Negative Retries",
+			cfg: &Config{
+				Port: 8080,
+				Routes: []Route{
+					{
+						Path:     "/",
+						Retries:  -1,
+						Backends: []Backend{{URL: "http://localhost"}},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "Negative Timeout",
+			cfg: &Config{
+				Port: 8080,
+				Routes: []Route{
+					{
+						Path:     "/",
+						Timeout:  -1 * time.Second,
+						Backends: []Backend{{URL: "http://localhost"}},
+					},
+				},
+			},
+			expectError: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -291,6 +319,48 @@ func TestValidate(t *testing.T) {
 				t.Errorf("validate() error = %v, expectError %v", err, tt.expectError)
 			}
 		})
+	}
+}
+
+func TestLoadConfigRetriesAndCircuitBreaker(t *testing.T) {
+	yamlData := []byte(`
+port: 8080
+routes:
+  - path: "/resilient"
+    retries: 3
+    timeout: 2s
+    circuit_breaker:
+      failure_threshold: 4
+      cooldown: 5s
+    backends:
+      - url: "http://srv1"
+      - url: "http://srv2"
+`)
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, yamlData, 0644); err != nil {
+		t.Fatalf("Failed to write temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	r := cfg.Routes[0]
+	if r.Retries != 3 {
+		t.Errorf("Expected retries 3, got %d", r.Retries)
+	}
+	if r.Timeout != 2*time.Second {
+		t.Errorf("Expected timeout 2s, got %v", r.Timeout)
+	}
+	if r.CircuitBreaker == nil {
+		t.Fatal("Expected CircuitBreaker to be non-nil")
+	}
+	if r.CircuitBreaker.FailureThreshold != 4 {
+		t.Errorf("Expected failure_threshold 4, got %d", r.CircuitBreaker.FailureThreshold)
+	}
+	if r.CircuitBreaker.Cooldown != 5*time.Second {
+		t.Errorf("Expected cooldown 5s, got %v", r.CircuitBreaker.Cooldown)
 	}
 }
 

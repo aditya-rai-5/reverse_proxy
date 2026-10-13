@@ -149,3 +149,47 @@ func TestHealthzHandlerAlgorithmAndWeight(t *testing.T) {
 		t.Errorf("Expected backend weight 2, got %d", data.Routes[0].Backends[0].Weight)
 	}
 }
+
+func TestHealthzHandlerCircuitBreakerOpen(t *testing.T) {
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path: "/",
+				Backends: []config.Backend{
+					{URL: "http://localhost:9001"},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	// Trip circuit breaker by recording 5 failures
+	u := r.Entries()[0].LB.BackendURL(0)
+	for i := 0; i < 5; i++ {
+		r.Entries()[0].LB.RecordFailure(u)
+	}
+
+	handler := makeHealthzHandler(r)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected 503 Service Unavailable when circuit breaker is open, got %d", rec.Code)
+	}
+
+	var data map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&data); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if data["status"] != "degraded" {
+		t.Errorf("Expected status 'degraded', got %v", data["status"])
+	}
+}

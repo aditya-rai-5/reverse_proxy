@@ -12,14 +12,16 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/aditya-rai-5/reverse_proxy/circuitbreaker"
 	"github.com/aditya-rai-5/reverse_proxy/config"
 )
 
-// ErrNoHealthyBackend is returned when every backend is unhealthy.
+// ErrNoHealthyBackend is returned when every backend is unhealthy or unavailable.
 var ErrNoHealthyBackend = errors.New("no healthy backends available")
 
-// backend wraps a parsed URL with its health state, weight, and in-flight counters.
+// backend wraps a parsed URL with its health state, weight, in-flight counters, and circuit breaker.
 type backend struct {
 	url               *url.URL
 	healthy           atomic.Bool
@@ -27,6 +29,14 @@ type backend struct {
 	currentWeight     int64
 	activeConnections atomic.Int64
 	id                string
+	cb                *circuitbreaker.CircuitBreaker
+}
+
+func (be *backend) isAvailable(excluded map[string]bool) bool {
+	if excluded != nil && excluded[be.url.String()] {
+		return false
+	}
+	return be.healthy.Load() && be.cb.AllowRequest()
 }
 
 // Result is returned by Select and includes the selected URL, an optional
@@ -55,14 +65,23 @@ func WithCookieName(name string) Option {
 	}
 }
 
+// WithCircuitBreaker sets the circuit breaker configuration for backends.
+func WithCircuitBreaker(cfg circuitbreaker.Config) Option {
+	return func(lb *LoadBalancer) {
+		lb.cbConfig = cfg
+	}
+}
+
 // LoadBalancer distributes requests across backends using configurable algorithms:
-// Round-Robin, Weighted Round-Robin, Least Connections, IP Hash, and Sticky Sessions.
+// Round-Robin, Weighted Round-Robin, Least Connections, IP Hash, and Sticky Sessions,
+// with integrated Circuit Breaker protection.
 type LoadBalancer struct {
 	backends   []*backend
 	algorithm  string
 	cookieName string
+	cbConfig   circuitbreaker.Config
 	counter    atomic.Uint64
-	mu         sync.Mutex
+	mu         sync.Mutex // guards currentWeight calculations in weighted round-robin
 }
 
 // New creates a LoadBalancer from the given config backends and optional configuration options.
@@ -84,7 +103,7 @@ func New(backends []config.Backend, opts ...Option) (*LoadBalancer, error) {
 			weight: w,
 			id:     backendID(u),
 		}
-		be.healthy.Store(true) // optimistic: assume healthy until proven otherwise
+		be.healthy.Store(true)
 		bs = append(bs, be)
 	}
 
@@ -92,6 +111,10 @@ func New(backends []config.Backend, opts ...Option) (*LoadBalancer, error) {
 		backends:   bs,
 		algorithm:  config.AlgorithmRoundRobin,
 		cookieName: "SERVERID",
+		cbConfig: circuitbreaker.Config{
+			FailureThreshold: 5,
+			Cooldown:         10 * time.Second,
+		},
 	}
 
 	for _, opt := range opts {
@@ -107,24 +130,33 @@ func New(backends []config.Backend, opts ...Option) (*LoadBalancer, error) {
 		lb.cookieName = "SERVERID"
 	}
 
+	for _, be := range bs {
+		be.cb = circuitbreaker.New(lb.cbConfig)
+	}
+
 	return lb, nil
 }
 
 // Select routes a request to an appropriate backend according to the configured algorithm.
 func (lb *LoadBalancer) Select(req *http.Request) (*Result, error) {
+	return lb.SelectExcluding(req, nil)
+}
+
+// SelectExcluding routes a request to an appropriate backend, excluding any URLs present in excluded.
+func (lb *LoadBalancer) SelectExcluding(req *http.Request, excluded map[string]bool) (*Result, error) {
 	switch lb.algorithm {
 	case config.AlgorithmWeightedRoundRobin:
-		return lb.nextWeightedRoundRobin()
+		return lb.nextWeightedRoundRobin(excluded)
 	case config.AlgorithmLeastConn:
-		return lb.nextLeastConn()
+		return lb.nextLeastConn(excluded)
 	case config.AlgorithmIPHash:
-		return lb.nextIPHash(req)
+		return lb.nextIPHash(req, excluded)
 	case config.AlgorithmSticky:
-		return lb.nextSticky(req)
+		return lb.nextSticky(req, excluded)
 	case config.AlgorithmRoundRobin:
 		fallthrough
 	default:
-		return lb.nextRoundRobin()
+		return lb.nextRoundRobin(excluded)
 	}
 }
 
@@ -142,7 +174,7 @@ func (lb *LoadBalancer) Next() (*url.URL, error) {
 	return res.URL, nil
 }
 
-func (lb *LoadBalancer) nextRoundRobin() (*Result, error) {
+func (lb *LoadBalancer) nextRoundRobin(excluded map[string]bool) (*Result, error) {
 	n := uint64(len(lb.backends))
 	if n == 0 {
 		return nil, ErrNoHealthyBackend
@@ -151,7 +183,7 @@ func (lb *LoadBalancer) nextRoundRobin() (*Result, error) {
 	start := lb.counter.Add(1) - 1
 	for i := uint64(0); i < n; i++ {
 		be := lb.backends[(start+i)%n]
-		if be.healthy.Load() {
+		if be.isAvailable(excluded) {
 			return &Result{URL: be.url}, nil
 		}
 	}
@@ -160,7 +192,7 @@ func (lb *LoadBalancer) nextRoundRobin() (*Result, error) {
 }
 
 // nextWeightedRoundRobin implements Smooth Weighted Round-Robin (Nginx algorithm).
-func (lb *LoadBalancer) nextWeightedRoundRobin() (*Result, error) {
+func (lb *LoadBalancer) nextWeightedRoundRobin(excluded map[string]bool) (*Result, error) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
@@ -168,7 +200,7 @@ func (lb *LoadBalancer) nextWeightedRoundRobin() (*Result, error) {
 	var chosen *backend
 
 	for _, be := range lb.backends {
-		if !be.healthy.Load() {
+		if !be.isAvailable(excluded) {
 			continue
 		}
 		be.currentWeight += int64(be.weight)
@@ -188,7 +220,7 @@ func (lb *LoadBalancer) nextWeightedRoundRobin() (*Result, error) {
 }
 
 // nextLeastConn routes to the healthy backend with the lowest active in-flight requests.
-func (lb *LoadBalancer) nextLeastConn() (*Result, error) {
+func (lb *LoadBalancer) nextLeastConn(excluded map[string]bool) (*Result, error) {
 	n := len(lb.backends)
 	if n == 0 {
 		return nil, ErrNoHealthyBackend
@@ -201,7 +233,7 @@ func (lb *LoadBalancer) nextLeastConn() (*Result, error) {
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
 		be := lb.backends[idx]
-		if !be.healthy.Load() {
+		if !be.isAvailable(excluded) {
 			continue
 		}
 		conns := be.activeConnections.Load()
@@ -227,10 +259,10 @@ func (lb *LoadBalancer) nextLeastConn() (*Result, error) {
 }
 
 // nextIPHash hashes the client IP address to deterministically pin client requests to a backend.
-func (lb *LoadBalancer) nextIPHash(req *http.Request) (*Result, error) {
+func (lb *LoadBalancer) nextIPHash(req *http.Request, excluded map[string]bool) (*Result, error) {
 	var healthy []*backend
 	for _, be := range lb.backends {
-		if be.healthy.Load() {
+		if be.isAvailable(excluded) {
 			healthy = append(healthy, be)
 		}
 	}
@@ -249,24 +281,24 @@ func (lb *LoadBalancer) nextIPHash(req *http.Request) (*Result, error) {
 }
 
 // nextSticky uses a session cookie to maintain affinity to the chosen backend.
-func (lb *LoadBalancer) nextSticky(req *http.Request) (*Result, error) {
+func (lb *LoadBalancer) nextSticky(req *http.Request, excluded map[string]bool) (*Result, error) {
 	if req != nil {
 		cookie, err := req.Cookie(lb.cookieName)
 		if err == nil && cookie.Value != "" {
 			for _, be := range lb.backends {
 				if be.id == cookie.Value {
-					if be.healthy.Load() {
+					if be.isAvailable(excluded) {
 						return &Result{URL: be.url}, nil
 					}
-					// Previously assigned backend is unhealthy; re-elect below
+					// Previously assigned backend is unavailable or excluded; re-elect below
 					break
 				}
 			}
 		}
 	}
 
-	// No valid cookie or sticky server is unhealthy: choose via round-robin
-	res, err := lb.nextRoundRobin()
+	// No valid cookie or sticky server is unavailable: choose via round-robin
+	res, err := lb.nextRoundRobin(excluded)
 	if err != nil {
 		return nil, err
 	}
@@ -290,9 +322,48 @@ func (lb *LoadBalancer) nextSticky(req *http.Request) (*Result, error) {
 	return res, nil
 }
 
+// RecordSuccess records a successful request for the given backend URL.
+func (lb *LoadBalancer) RecordSuccess(u *url.URL) {
+	if u == nil {
+		return
+	}
+	for _, be := range lb.backends {
+		if be.url.String() == u.String() {
+			be.cb.RecordSuccess()
+			return
+		}
+	}
+}
+
+// RecordFailure records a failed request (e.g. 502, timeout, dial failure) for the given backend URL.
+func (lb *LoadBalancer) RecordFailure(u *url.URL) {
+	if u == nil {
+		return
+	}
+	for _, be := range lb.backends {
+		if be.url.String() == u.String() {
+			be.cb.RecordFailure()
+			return
+		}
+	}
+}
+
+// CircuitBreakerState returns the circuit breaker state of the backend at index idx.
+func (lb *LoadBalancer) CircuitBreakerState(idx int) circuitbreaker.State {
+	return lb.backends[idx].cb.State()
+}
+
+// ConsecutiveFailures returns the consecutive failure count of the backend at index idx.
+func (lb *LoadBalancer) ConsecutiveFailures(idx int) int {
+	return lb.backends[idx].cb.ConsecutiveFailures()
+}
+
 // MarkHealthy sets the health state of the backend at the given index.
 func (lb *LoadBalancer) MarkHealthy(idx int, healthy bool) {
 	lb.backends[idx].healthy.Store(healthy)
+	if healthy {
+		lb.backends[idx].cb.RecordSuccess()
+	}
 }
 
 // IsHealthy reports the current health state of the backend at index idx.

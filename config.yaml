@@ -6,10 +6,15 @@ health_check:
   timeout: 5s
 
 routes:
-  # Weighted Round-Robin: beefier backend (weight 2) takes 2x traffic
+  # Weighted Round-Robin with Retries & Circuit Breaker
   - path: "/api"
     strip_prefix: "/api"
     algorithm: "weighted_round_robin"
+    retries: 2
+    timeout: 3s
+    circuit_breaker:
+      failure_threshold: 5 
+      cooldown: 10s
     backends:
       - url: "http://localhost:9001"
         weight: 2
@@ -19,6 +24,8 @@ routes:
   # Least Connections: routes to backend with least in-flight requests
   - path: "/compute"
     algorithm: "least_conn"
+    retries: 1
+    timeout: 5s
     backends:
       - url: "http://localhost:9003"
       - url: "http://localhost:9004"
@@ -27,6 +34,7 @@ routes:
   - path: "/app"
     algorithm: "sticky"
     cookie_name: "SERVERID"
+    retries: 1
     backends:
       - url: "http://localhost:9005"
       - url: "http://localhost:9006"
@@ -34,6 +42,7 @@ routes:
   # IP Hash: hashes client IP to deterministically pin user requests
   - path: "/ip"
     algorithm: "ip_hash"
+    retries: 1
     backends:
       - url: "http://localhost:9007"
       - url: "http://localhost:9008"

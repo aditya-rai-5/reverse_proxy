@@ -7,7 +7,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/aditya-rai-5/reverse_proxy/circuitbreaker"
 	"github.com/aditya-rai-5/reverse_proxy/config"
 	"github.com/aditya-rai-5/reverse_proxy/loadbalancer"
 )
@@ -16,6 +18,8 @@ type Entry struct {
 	Path        string
 	StripPrefix string
 	LB          *loadbalancer.LoadBalancer
+	Retries     int
+	Timeout     time.Duration
 	rewriteRe   *regexp.Regexp
 	replacement string
 }
@@ -28,6 +32,11 @@ func (e *Entry) Next() (*url.URL, error) {
 // Select routes a request through the entry's load balancer according to its algorithm.
 func (e *Entry) Select(req *http.Request) (*loadbalancer.Result, error) {
 	return e.LB.Select(req)
+}
+
+// SelectExcluding routes a request through the entry's load balancer, excluding any URLs in excluded.
+func (e *Entry) SelectExcluding(req *http.Request, excluded map[string]bool) (*loadbalancer.Result, error) {
+	return e.LB.SelectExcluding(req, excluded)
 }
 
 // RewritePath applies configured prefix stripping and regex rewriting to requestPath.
@@ -62,11 +71,18 @@ func New(cfg *config.Config) (*Router, error) {
 	entries := make([]Entry, 0, len(cfg.Routes))
 
 	for _, route := range cfg.Routes {
-		lb, err := loadbalancer.New(
-			route.Backends,
+		opts := []loadbalancer.Option{
 			loadbalancer.WithAlgorithm(route.Algorithm),
 			loadbalancer.WithCookieName(route.CookieName),
-		)
+		}
+		if route.CircuitBreaker != nil {
+			opts = append(opts, loadbalancer.WithCircuitBreaker(circuitbreaker.Config{
+				FailureThreshold: route.CircuitBreaker.FailureThreshold,
+				Cooldown:         route.CircuitBreaker.Cooldown,
+			}))
+		}
+
+		lb, err := loadbalancer.New(route.Backends, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", route.Path, err)
 		}
@@ -75,6 +91,8 @@ func New(cfg *config.Config) (*Router, error) {
 			Path:        route.Path,
 			StripPrefix: route.StripPrefix,
 			LB:          lb,
+			Retries:     route.Retries,
+			Timeout:     route.Timeout,
 		}
 
 		if route.Rewrite != nil {
