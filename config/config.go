@@ -63,6 +63,22 @@ func (cb *CircuitBreakerConfig) Defaults() {
 	}
 }
 
+// RateLimit holds configuration for token bucket rate limiting.
+type RateLimit struct {
+	RequestsPerMinute int `yaml:"requests_per_minute" json:"requests_per_minute"`
+	Burst             int `yaml:"burst" json:"burst"`
+}
+
+func (rl *RateLimit) Enabled() bool {
+	return rl != nil && rl.RequestsPerMinute > 0
+}
+
+func (rl *RateLimit) Defaults() {
+	if rl.RequestsPerMinute > 0 && rl.Burst <= 0 {
+		rl.Burst = 1
+	}
+}
+
 type Route struct {
 	Path           string                `yaml:"path"`
 	StripPrefix    string                `yaml:"strip_prefix"`
@@ -72,12 +88,13 @@ type Route struct {
 	Retries        int                   `yaml:"retries,omitempty"`
 	Timeout        time.Duration         `yaml:"timeout,omitempty"`
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuit_breaker,omitempty"`
+	RateLimit      *RateLimit            `yaml:"rate_limit,omitempty"`
 	Backends       []Backend             `yaml:"backends"`
 }
 
 // HealthCheck holds configuration for backend health probing.
 type HealthCheck struct {
-	Path     string `yaml:"path"`
+	Path     string        `yaml:"path"`
 	Interval time.Duration `yaml:"interval"`
 	Timeout  time.Duration `yaml:"timeout"`
 }
@@ -97,6 +114,7 @@ func (hc *HealthCheck) defaults() {
 
 type Config struct {
 	Port        int         `yaml:"port"`
+	RateLimit   *RateLimit  `yaml:"rate_limit,omitempty"`
 	Routes      []Route     `yaml:"routes"`
 	HealthCheck HealthCheck `yaml:"health_check"`
 }
@@ -125,6 +143,15 @@ func Load(path string) (*Config, error) {
 func validate(cfg *Config) error {
 	if cfg.Port == 0 {
 		return fmt.Errorf("port must be specified")
+	}
+	if cfg.RateLimit != nil {
+		if cfg.RateLimit.RequestsPerMinute < 0 {
+			return fmt.Errorf("rate_limit: requests_per_minute must be non-negative")
+		}
+		if cfg.RateLimit.Burst < 0 {
+			return fmt.Errorf("rate_limit: burst must be non-negative")
+		}
+		cfg.RateLimit.Defaults()
 	}
 	if len(cfg.Routes) == 0 {
 		return fmt.Errorf("at least one route must be defined")
@@ -199,6 +226,16 @@ func validate(cfg *Config) error {
 			route.CircuitBreaker = &CircuitBreakerConfig{}
 		}
 		route.CircuitBreaker.Defaults()
+
+		if route.RateLimit != nil {
+			if route.RateLimit.RequestsPerMinute < 0 {
+				return fmt.Errorf("route[%d]: rate_limit.requests_per_minute must be non-negative", i)
+			}
+			if route.RateLimit.Burst < 0 {
+				return fmt.Errorf("route[%d]: rate_limit.burst must be non-negative", i)
+			}
+			route.RateLimit.Defaults()
+		}
 	}
 	return nil
 }

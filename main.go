@@ -15,23 +15,33 @@ import (
 	"github.com/aditya-rai-5/reverse_proxy/config"
 	"github.com/aditya-rai-5/reverse_proxy/healthcheck"
 	"github.com/aditya-rai-5/reverse_proxy/proxy"
+	"github.com/aditya-rai-5/reverse_proxy/ratelimit"
 	"github.com/aditya-rai-5/reverse_proxy/router"
 )
 
+// buildHandler creates the proxy handler and applies the global rate limiting middleware if configured.
+func buildHandler(cfg *config.Config, r *router.Router) http.Handler {
+	var handler http.Handler = proxy.New(r)
+	if cfg.RateLimit != nil && cfg.RateLimit.Enabled() {
+		rl := ratelimit.New(ratelimit.Config{
+			RequestsPerMinute: cfg.RateLimit.RequestsPerMinute,
+			Burst:             cfg.RateLimit.Burst,
+		})
+		handler = rl.Middleware(handler)
+	}
+	return handler
+}
+
 func main() {
-	// Load config from YAML file.
 	cfg, err := config.Load("config.yaml")
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	// Build the router (path → load balancer mappings).
 	r, err := router.New(cfg)
 	if err != nil {
 		log.Fatalf("failed to build router: %v", err)
 	}
-
-	// Context that is cancelled on SIGINT / SIGTERM for clean shutdown.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -42,40 +52,33 @@ func main() {
 		hc.Start(ctx, &hcWg)
 	}
 
-	// Create the proxy handler.
-	handler := proxy.New(r)
+	handler := buildHandler(cfg, r)
 
-	// Register routes on the default mux.
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)
-	mux.HandleFunc("/healthz", makeHealthzHandler(r))
+	mux.HandleFunc("/healthz", makeHealthzHandler(r, cfg))
 
-	// Start the HTTP server.
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	srv := &http.Server{Addr: addr, Handler: mux}
 
 	log.Printf("Reverse proxy listening on %s (health check: path=%s interval=%s timeout=%s)",
 		addr, cfg.HealthCheck.Path, cfg.HealthCheck.Interval, cfg.HealthCheck.Timeout)
 
-	// Run server in a goroutine so we can block on ctx cancellation below.
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}
 	}()
 
-	// Wait for shutdown signal.
 	<-ctx.Done()
 	log.Println("Shutting down…")
 
-	// Give in-flight requests 10 s to complete.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("graceful shutdown error: %v", err)
 	}
 
-	// Wait for all health-check goroutines to stop.
 	hcWg.Wait()
 	log.Println("All health checkers stopped. Bye!")
 }
@@ -90,16 +93,22 @@ type backendStatus struct {
 	ConsecutiveFailures int    `json:"consecutive_failures,omitempty"`
 }
 
+type rateLimitStatus struct {
+	RequestsPerMinute int `json:"requests_per_minute"`
+	Burst             int `json:"burst"`
+}
+
 type routeStatus struct {
-	Path      string          `json:"path"`
-	Algorithm string          `json:"algorithm,omitempty"`
-	Retries   int             `json:"retries,omitempty"`
-	Backends  []backendStatus `json:"backends"`
+	Path      string           `json:"path"`
+	Algorithm string           `json:"algorithm,omitempty"`
+	Retries   int              `json:"retries,omitempty"`
+	RateLimit *rateLimitStatus `json:"rate_limit,omitempty"`
+	Backends  []backendStatus  `json:"backends"`
 }
 
 // makeHealthzHandler returns an HTTP handler that reports the health of every
 // backend across all routes as a JSON document.
-func makeHealthzHandler(r *router.Router) http.HandlerFunc {
+func makeHealthzHandler(r *router.Router, cfg ...*config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		var routes []routeStatus
 		allHealthy := true
@@ -121,19 +130,26 @@ func makeHealthzHandler(r *router.Router) http.HandlerFunc {
 					ConsecutiveFailures: entry.LB.ConsecutiveFailures(i),
 				})
 			}
-			routes = append(routes, routeStatus{
+			rs := routeStatus{
 				Path:      entry.Path,
 				Algorithm: entry.LB.Algorithm(),
 				Retries:   entry.Retries,
 				Backends:  bs,
-			})
+			}
+			if entry.RateLimiter != nil {
+				rs.RateLimit = &rateLimitStatus{
+					RequestsPerMinute: entry.RateLimiter.RequestsPerMinute(),
+					Burst:             entry.RateLimiter.Burst(),
+				}
+			}
+			routes = append(routes, rs)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		if !allHealthy {
-			w.WriteHeader(http.StatusServiceUnavailable) // 503 so monitors can alert
+			w.WriteHeader(http.StatusServiceUnavailable)
 		}
-		json.NewEncoder(w).Encode(map[string]any{
+		resp := map[string]any{
 			"status": func() string {
 				if allHealthy {
 					return "healthy"
@@ -141,6 +157,10 @@ func makeHealthzHandler(r *router.Router) http.HandlerFunc {
 				return "degraded"
 			}(),
 			"routes": routes,
-		})
+		}
+		if len(cfg) > 0 && cfg[0] != nil && cfg[0].RateLimit != nil && cfg[0].RateLimit.Enabled() {
+			resp["rate_limit"] = cfg[0].RateLimit
+		}
+		json.NewEncoder(w).Encode(resp)
 	}
 }

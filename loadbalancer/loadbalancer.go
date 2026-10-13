@@ -6,16 +6,15 @@ import (
 	"errors"
 	"hash/fnv"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aditya-rai-5/reverse_proxy/circuitbreaker"
 	"github.com/aditya-rai-5/reverse_proxy/config"
+	"github.com/aditya-rai-5/reverse_proxy/ratelimit"
 )
 
 // ErrNoHealthyBackend is returned when every backend is unhealthy or unavailable.
@@ -191,7 +190,7 @@ func (lb *LoadBalancer) nextRoundRobin(excluded map[string]bool) (*Result, error
 	return nil, ErrNoHealthyBackend
 }
 
-// nextWeightedRoundRobin implements Smooth Weighted Round-Robin (Nginx algorithm).
+// nextWeightedRoundRobin implements Smooth Weighted Round-Robin.
 func (lb *LoadBalancer) nextWeightedRoundRobin(excluded map[string]bool) (*Result, error) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
@@ -290,20 +289,17 @@ func (lb *LoadBalancer) nextSticky(req *http.Request, excluded map[string]bool) 
 					if be.isAvailable(excluded) {
 						return &Result{URL: be.url}, nil
 					}
-					// Previously assigned backend is unavailable or excluded; re-elect below
 					break
 				}
 			}
 		}
 	}
 
-	// No valid cookie or sticky server is unavailable: choose via round-robin
 	res, err := lb.nextRoundRobin(excluded)
 	if err != nil {
 		return nil, err
 	}
 
-	// Find the chosen backend's id to construct the cookie
 	var chosenID string
 	for _, be := range lb.backends {
 		if be.url.String() == res.URL.String() {
@@ -402,28 +398,5 @@ func backendID(u *url.URL) string {
 }
 
 func extractClientIP(r *http.Request) string {
-	if r == nil {
-		return "127.0.0.1"
-	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		ip := strings.TrimSpace(parts[0])
-		if ip != "" {
-			return ip
-		}
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		ip := strings.TrimSpace(xri)
-		if ip != "" {
-			return ip
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && host != "" {
-		return host
-	}
-	if r.RemoteAddr != "" {
-		return r.RemoteAddr
-	}
-	return "127.0.0.1"
+	return ratelimit.ExtractClientIP(r)
 }

@@ -65,7 +65,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read and buffer request body if present, so it can be resent on retries.
+	if entry.RateLimiter != nil && !entry.RateLimiter.AllowRequest(r) {
+		log.Printf("[PROXY] rate limit exceeded for route %s from %s", entry.Path, r.RemoteAddr)
+		w.Header().Set("Retry-After", entry.RateLimiter.RetryAfterHeader())
+		http.Error(w, "429 Too Many Requests: rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
 	var bodyBytes []byte
 	if r.Body != nil {
 		bodyBytes, err = io.ReadAll(r.Body)

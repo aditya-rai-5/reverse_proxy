@@ -333,3 +333,49 @@ func TestRouterAlgorithmConfiguration(t *testing.T) {
 		t.Fatal("Expected non-nil URL from Select")
 	}
 }
+
+func TestRouterRateLimiterConfiguration(t *testing.T) {
+	cfg := &config.Config{
+		Routes: []config.Route{
+			{
+				Path: "/rate-limited",
+				RateLimit: &config.RateLimit{
+					RequestsPerMinute: 60,
+					Burst:             5,
+				},
+				Backends: []config.Backend{{URL: "http://srv1"}},
+			},
+			{
+				Path:     "/unlimited",
+				Backends: []config.Backend{{URL: "http://srv2"}},
+			},
+		},
+	}
+
+	r, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	entryLimited, err := r.Match("/rate-limited/items")
+	if err != nil {
+		t.Fatalf("Match failed: %v", err)
+	}
+	if entryLimited.RateLimiter == nil {
+		t.Fatal("Expected RateLimiter to be initialized on /rate-limited route")
+	}
+	if entryLimited.RateLimiter.RequestsPerMinute() != 60 {
+		t.Errorf("Expected 60 requests/min, got %d", entryLimited.RateLimiter.RequestsPerMinute())
+	}
+	if entryLimited.RateLimiter.Burst() != 5 {
+		t.Errorf("Expected burst 5, got %d", entryLimited.RateLimiter.Burst())
+	}
+
+	entryUnlimited, err := r.Match("/unlimited/items")
+	if err != nil {
+		t.Fatalf("Match failed: %v", err)
+	}
+	if entryUnlimited.RateLimiter != nil {
+		t.Errorf("Expected nil RateLimiter on /unlimited route, got %+v", entryUnlimited.RateLimiter)
+	}
+}

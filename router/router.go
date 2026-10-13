@@ -12,6 +12,7 @@ import (
 	"github.com/aditya-rai-5/reverse_proxy/circuitbreaker"
 	"github.com/aditya-rai-5/reverse_proxy/config"
 	"github.com/aditya-rai-5/reverse_proxy/loadbalancer"
+	"github.com/aditya-rai-5/reverse_proxy/ratelimit"
 )
 
 type Entry struct {
@@ -20,6 +21,7 @@ type Entry struct {
 	LB          *loadbalancer.LoadBalancer
 	Retries     int
 	Timeout     time.Duration
+	RateLimiter *ratelimit.Limiter
 	rewriteRe   *regexp.Regexp
 	replacement string
 }
@@ -87,12 +89,21 @@ func New(cfg *config.Config) (*Router, error) {
 			return nil, fmt.Errorf("route %q: %w", route.Path, err)
 		}
 
+		var rl *ratelimit.Limiter
+		if route.RateLimit != nil && route.RateLimit.Enabled() {
+			rl = ratelimit.New(ratelimit.Config{
+				RequestsPerMinute: route.RateLimit.RequestsPerMinute,
+				Burst:             route.RateLimit.Burst,
+			})
+		}
+
 		entry := Entry{
 			Path:        route.Path,
 			StripPrefix: route.StripPrefix,
 			LB:          lb,
 			Retries:     route.Retries,
 			Timeout:     route.Timeout,
+			RateLimiter: rl,
 		}
 
 		if route.Rewrite != nil {

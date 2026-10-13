@@ -12,6 +12,7 @@ A fast, production-style HTTP reverse proxy with path-based routing, path stripp
   - **Least Connections (`least_conn`):** Real-time tracking of active in-flight requests per backend, routing each request to the least busy healthy server.
   - **IP Hash (`ip_hash`):** Deterministic hashing of client IP (from `RemoteAddr` or `X-Forwarded-For`), pinning clients to backends with automatic failover.
   - **Sticky Sessions (`sticky`):** Cookie-based session persistence (configurable `cookie_name`) ensuring subsequent user requests stay on the same backend, with automatic health failover.
+- **Rate Limiting Middleware:** Protects backends from abuse using the token bucket algorithm (`golang.org/x/time/rate`). Enforces per-IP limits configured in YAML (globally or per-route via `requests_per_minute` and `burst`). Returns HTTP `429 Too Many Requests` with a `Retry-After` header when exceeded, with automatic background TTL cleanup of inactive client IP entries.
 - **Automatic Request Retries:** If an upstream backend returns `502 Bad Gateway`, `504 Gateway Timeout`, or encounters a connection error/timeout, the proxy immediately replays the request (including buffered request body) on an alternate healthy backend before failing to the client.
 - **Circuit Breaking:** Tracks consecutive failures per backend. If a backend fails 5 consecutive times (configurable `failure_threshold`), the circuit breaker trips **Open**, immediately skipping the backend for subsequent client requests so clients are not slowed down. Automatically transitions to **Half-Open** after a cooldown period (`cooldown`) to test backend recovery.
 - **Active Health Checks:** Periodic background HTTP probing of all upstream backends with automatic failure detection and recovery.
@@ -26,6 +27,11 @@ Configure routes and features via `config.yaml`:
 
 ```yaml
 port: 8080
+
+# Global per-IP rate limiting (token bucket via golang.org/x/time/rate)
+rate_limit:
+  requests_per_minute: 60
+  burst: 10
 
 health_check:
   path: "/health"
@@ -48,11 +54,14 @@ routes:
       - url: "http://localhost:9002"
         weight: 1
 
-  # Least Connections: routes to backend with least in-flight requests
+  # Least Connections: routes to backend with least in-flight requests (with route-level rate limit)
   - path: "/compute"
     algorithm: "least_conn"
     retries: 1
     timeout: 5s
+    rate_limit:
+      requests_per_minute: 30
+      burst: 5
     backends:
       - url: "http://localhost:9003"
       - url: "http://localhost:9004"

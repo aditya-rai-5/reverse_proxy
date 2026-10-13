@@ -310,6 +310,65 @@ func TestValidate(t *testing.T) {
 			},
 			expectError: true,
 		},
+		{
+			name: "Negative Global Rate Limit RequestsPerMinute",
+			cfg: &Config{
+				Port: 8080,
+				RateLimit: &RateLimit{
+					RequestsPerMinute: -1,
+					Burst:             10,
+				},
+				Routes: []Route{
+					{Path: "/", Backends: []Backend{{URL: "http://localhost"}}},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "Negative Global Rate Limit Burst",
+			cfg: &Config{
+				Port: 8080,
+				RateLimit: &RateLimit{
+					RequestsPerMinute: 60,
+					Burst:             -1,
+				},
+				Routes: []Route{
+					{Path: "/", Backends: []Backend{{URL: "http://localhost"}}},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "Negative Route Rate Limit",
+			cfg: &Config{
+				Port: 8080,
+				Routes: []Route{
+					{
+						Path: "/",
+						RateLimit: &RateLimit{
+							RequestsPerMinute: -5,
+							Burst:             2,
+						},
+						Backends: []Backend{{URL: "http://localhost"}},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "Valid Rate Limit Defaults Burst",
+			cfg: &Config{
+				Port: 8080,
+				RateLimit: &RateLimit{
+					RequestsPerMinute: 60,
+					Burst:             0,
+				},
+				Routes: []Route{
+					{Path: "/", Backends: []Backend{{URL: "http://localhost"}}},
+				},
+			},
+			expectError: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -364,6 +423,60 @@ routes:
 	}
 }
 
+func TestLoadConfigRateLimit(t *testing.T) {
+	yamlData := []byte(`
+port: 8080
+rate_limit:
+  requests_per_minute: 60
+  burst: 10
+routes:
+  - path: "/api"
+    rate_limit:
+      requests_per_minute: 120
+      burst: 20
+    backends:
+      - url: "http://srv1"
+  - path: "/"
+    backends:
+      - url: "http://srv2"
+`)
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, yamlData, 0644); err != nil {
+		t.Fatalf("Failed to write temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if cfg.RateLimit == nil {
+		t.Fatal("Expected global RateLimit to be loaded")
+	}
+	if cfg.RateLimit.RequestsPerMinute != 60 {
+		t.Errorf("Expected global requests_per_minute 60, got %d", cfg.RateLimit.RequestsPerMinute)
+	}
+	if cfg.RateLimit.Burst != 10 {
+		t.Errorf("Expected global burst 10, got %d", cfg.RateLimit.Burst)
+	}
+
+	r0 := cfg.Routes[0]
+	if r0.RateLimit == nil {
+		t.Fatal("Expected route 0 RateLimit to be loaded")
+	}
+	if r0.RateLimit.RequestsPerMinute != 120 {
+		t.Errorf("Expected route 0 requests_per_minute 120, got %d", r0.RateLimit.RequestsPerMinute)
+	}
+	if r0.RateLimit.Burst != 20 {
+		t.Errorf("Expected route 0 burst 20, got %d", r0.RateLimit.Burst)
+	}
+
+	r1 := cfg.Routes[1]
+	if r1.RateLimit != nil {
+		t.Errorf("Expected route 1 RateLimit to be nil, got %+v", r1.RateLimit)
+	}
+}
+
 func TestLoadConfigAlgorithmsAndWeights(t *testing.T) {
 	yamlData := []byte(`
 port: 8080
@@ -409,7 +522,6 @@ routes:
 		t.Fatalf("Expected 5 routes, got %d", len(cfg.Routes))
 	}
 
-	// Route 0: Weighted Round Robin
 	r0 := cfg.Routes[0]
 	if r0.Algorithm != AlgorithmWeightedRoundRobin {
 		t.Errorf("Route 0: expected algorithm %q, got %q", AlgorithmWeightedRoundRobin, r0.Algorithm)
@@ -418,7 +530,6 @@ routes:
 		t.Errorf("Route 0: unexpected weights %d, %d", r0.Backends[0].Weight, r0.Backends[1].Weight)
 	}
 
-	// Route 1: Least Conn
 	r1 := cfg.Routes[1]
 	if r1.Algorithm != AlgorithmLeastConn {
 		t.Errorf("Route 1: expected algorithm %q, got %q", AlgorithmLeastConn, r1.Algorithm)
@@ -427,7 +538,6 @@ routes:
 		t.Errorf("Route 1: expected default weight 1, got %d", r1.Backends[0].Weight)
 	}
 
-	// Route 2: Sticky with custom cookie name
 	r2 := cfg.Routes[2]
 	if r2.Algorithm != AlgorithmSticky {
 		t.Errorf("Route 2: expected algorithm %q, got %q", AlgorithmSticky, r2.Algorithm)
@@ -436,13 +546,11 @@ routes:
 		t.Errorf("Route 2: expected cookie_name 'MY_SESSION', got %q", r2.CookieName)
 	}
 
-	// Route 3: IP Hash
 	r3 := cfg.Routes[3]
 	if r3.Algorithm != AlgorithmIPHash {
 		t.Errorf("Route 3: expected algorithm %q, got %q", AlgorithmIPHash, r3.Algorithm)
 	}
 
-	// Route 4: Inferred Weighted Round Robin
 	r4 := cfg.Routes[4]
 	if r4.Algorithm != AlgorithmWeightedRoundRobin {
 		t.Errorf("Route 4: expected inferred algorithm %q, got %q", AlgorithmWeightedRoundRobin, r4.Algorithm)

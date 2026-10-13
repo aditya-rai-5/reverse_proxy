@@ -958,3 +958,66 @@ func TestProxyTimeoutPerAttempt(t *testing.T) {
 		t.Errorf("Expected backend 2 to handle retry after timeout, got %d", count2.Load())
 	}
 }
+
+func TestProxyRouteRateLimiting(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("backend ok"))
+	}))
+	defer backend.Close()
+
+	cfg := &config.Config{
+		Port: 8080,
+		Routes: []config.Route{
+			{
+				Path: "/limited",
+				RateLimit: &config.RateLimit{
+					RequestsPerMinute: 60,
+					Burst:             2,
+				},
+				Backends: []config.Backend{
+					{URL: backend.URL},
+				},
+			},
+		},
+	}
+
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create router: %v", err)
+	}
+
+	handler := New(r)
+
+	for i := 1; i <= 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/limited/resource", nil)
+		req.RemoteAddr = "203.0.113.10:4000"
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Request %d from IP A: expected 200 OK, got %d", i, rec.Code)
+		}
+	}
+
+	req3 := httptest.NewRequest(http.MethodGet, "/limited/resource", nil)
+	req3.RemoteAddr = "203.0.113.10:5000"
+	rec3 := httptest.NewRecorder()
+	handler.ServeHTTP(rec3, req3)
+
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("Request 3 from IP A: expected 429 Too Many Requests, got %d", rec3.Code)
+	}
+	if rec3.Header().Get("Retry-After") == "" {
+		t.Error("Expected Retry-After header on 429 response")
+	}
+
+	reqB := httptest.NewRequest(http.MethodGet, "/limited/resource", nil)
+	reqB.RemoteAddr = "198.51.100.20:4000"
+	recB := httptest.NewRecorder()
+	handler.ServeHTTP(recB, reqB)
+
+	if recB.Code != http.StatusOK {
+		t.Fatalf("Request from IP B: expected 200 OK, got %d", recB.Code)
+	}
+}

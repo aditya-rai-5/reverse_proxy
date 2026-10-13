@@ -1,5 +1,10 @@
 port: 8080
 
+# Global per-IP rate limiting (token bucket via golang.org/x/time/rate)
+rate_limit:
+  requests_per_minute: 60
+  burst: 10
+
 health_check:
   path: "/health"
   interval: 10s
@@ -21,11 +26,14 @@ routes:
       - url: "http://localhost:9002"
         weight: 1
 
-  # Least Connections: routes to backend with least in-flight requests
+  # Least Connections: routes to backend with least in-flight requests (with route-level rate limit)
   - path: "/compute"
     algorithm: "least_conn"
     retries: 1
     timeout: 5s
+    rate_limit:
+      requests_per_minute: 30
+      burst: 5
     backends:
       - url: "http://localhost:9003"
       - url: "http://localhost:9004"
