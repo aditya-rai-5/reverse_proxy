@@ -20,6 +20,7 @@ A fast, production-style HTTP reverse proxy with path-based routing, path stripp
 - **Failover & Fault Tolerance:** Dead backends are automatically skipped across all load balancing algorithms; returns HTTP `503 Service Unavailable` if all backends are down.
 - **Header Forwarding:** Automatically preserves and forwards `X-Forwarded-For` and `X-Forwarded-Host`.
 - **Healthz Endpoint:** Exposes `GET /healthz` returning JSON status of all backends (including health status, weight, active in-flight connections, circuit breaker state, consecutive failures, and route algorithm).
+- **Prometheus Metrics:** Exposes `GET /metrics` with request totals by route/backend/status, request latency histograms, and backend health gauges.
 - **Graceful Shutdown:** Catches `SIGINT`/`SIGTERM` and drains in-flight requests with a 10-second timeout.
 - **HTTPS Termination:** Serve HTTPS using a configured certificate/key pair or automatically provision and renew Let's Encrypt certificates with `autocert`. TLS mode redirects ordinary HTTP traffic to HTTPS and leaves ACME HTTP-01 challenge paths available.
 
@@ -135,6 +136,17 @@ Run tests with test coverage:
 ```bash
 go test -cover ./...
 ```
+
+Prometheus can scrape the proxy with:
+
+```yaml
+scrape_configs:
+  - job_name: reverse-proxy
+    static_configs:
+      - targets: ["localhost:8080"]
+```
+
+When TLS is enabled, configure the scrape target to use the HTTPS listener.
 
 ## Running the Proxy
 

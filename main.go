@@ -18,6 +18,7 @@ import (
 
 	"github.com/aditya-rai-5/reverse_proxy/config"
 	"github.com/aditya-rai-5/reverse_proxy/healthcheck"
+	"github.com/aditya-rai-5/reverse_proxy/metrics"
 	"github.com/aditya-rai-5/reverse_proxy/proxy"
 	"github.com/aditya-rai-5/reverse_proxy/ratelimit"
 	"github.com/aditya-rai-5/reverse_proxy/router"
@@ -25,8 +26,12 @@ import (
 )
 
 // buildHandler creates the proxy handler and applies the global rate limiting middleware if configured.
-func buildHandler(cfg *config.Config, r *router.Router) http.Handler {
-	var handler http.Handler = proxy.NewWithTransportAndBodyLimit(r, nil, cfg.MaxRequestBodyBytes)
+func buildHandler(cfg *config.Config, r *router.Router, observers ...proxy.RequestObserver) http.Handler {
+	proxyHandler := proxy.NewWithTransportAndBodyLimit(r, nil, cfg.MaxRequestBodyBytes)
+	if len(observers) > 0 {
+		proxyHandler.SetRequestObserver(observers[0])
+	}
+	var handler http.Handler = proxyHandler
 	if cfg.RateLimit != nil && cfg.RateLimit.Enabled() {
 		rl := ratelimit.New(ratelimit.Config{
 			RequestsPerMinute: cfg.RateLimit.RequestsPerMinute,
@@ -57,9 +62,11 @@ func main() {
 		hc.Start(ctx, &hcWg)
 	}
 
-	handler := buildHandler(cfg, r)
+	proxyMetrics := metrics.New(r)
+	handler := buildHandler(cfg, r, proxyMetrics)
 
 	mux := http.NewServeMux()
+	mux.Handle("/metrics", proxyMetrics.Handler())
 	mux.Handle("/", handler)
 	mux.HandleFunc("/healthz", makeHealthzHandler(r, cfg))
 

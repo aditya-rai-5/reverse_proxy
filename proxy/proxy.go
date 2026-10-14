@@ -33,6 +33,18 @@ type Handler struct {
 	router              *router.Router
 	transport           http.RoundTripper
 	maxRequestBodyBytes int64
+	observer            RequestObserver
+}
+
+// RequestObserver receives one observation after the proxy has completed a
+// request. backend is empty when no backend was selected.
+type RequestObserver interface {
+	ObserveRequest(route, backend string, statusCode int, duration time.Duration)
+}
+
+// SetRequestObserver installs an optional observer for completed requests.
+func (h *Handler) SetRequestObserver(observer RequestObserver) {
+	h.observer = observer
 }
 
 // New creates a Handler backed by the given router using standard production transport.
@@ -78,12 +90,23 @@ func NewWithTransportAndBodyLimit(r *router.Router, transport http.RoundTripper,
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	tracked := &statusResponseWriter{ResponseWriter: w}
+	w = tracked
+	metricRoute, metricBackend := "unmatched", ""
+	defer func() {
+		if h.observer != nil {
+			h.observer.ObserveRequest(metricRoute, metricBackend, tracked.statusCode(), time.Since(started))
+		}
+	}()
+
 	entry, err := h.router.Match(r.URL.Path)
 	if err != nil {
 		log.Printf("[PROXY] no route for %s: %v", r.URL.Path, err)
 		http.Error(w, "502 Bad Gateway: no upstream route", http.StatusBadGateway)
 		return
 	}
+	metricRoute = entry.Path
 
 	if entry.RateLimiter != nil && !entry.RateLimiter.AllowRequest(r) {
 		log.Printf("[PROXY] rate limit exceeded for route %s from %s", entry.Path, r.RemoteAddr)
@@ -140,6 +163,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		target := result.URL
+		metricBackend = target.String()
 		excluded[target.String()] = true
 
 		success, statusCode, err := h.forward(w, r, entry, result, bodyBytes, bufferedBody)
@@ -162,6 +186,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "502 Bad Gateway: upstream error", http.StatusBadGateway)
 	}
 }
+
+// statusResponseWriter records the final HTTP status for request metrics.
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusResponseWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *statusResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.Entry, result *loadbalancer.Result, bodyBytes []byte, bufferedBody bool) (bool, int, error) {
 	if result.Done != nil {

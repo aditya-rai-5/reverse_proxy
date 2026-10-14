@@ -15,6 +15,54 @@ import (
 	"github.com/aditya-rai-5/reverse_proxy/router"
 )
 
+type observedRequest struct {
+	route, backend string
+	status         int
+	duration       time.Duration
+}
+
+type testRequestObserver struct{ requests []observedRequest }
+
+func (o *testRequestObserver) ObserveRequest(route, backend string, status int, duration time.Duration) {
+	o.requests = append(o.requests, observedRequest{route: route, backend: backend, status: status, duration: duration})
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestProxyReportsRequestMetricsObservation(t *testing.T) {
+	const backend = "http://backend.example"
+
+	r, err := router.New(&config.Config{Routes: []config.Route{{
+		Path: "/observed", Backends: []config.Backend{{URL: backend}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := &testRequestObserver{}
+	h := NewWithTransport(r, roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusAccepted,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("accepted")),
+		}, nil
+	}))
+	h.SetRequestObserver(observer)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/observed/item", nil))
+
+	if len(observer.requests) != 1 {
+		t.Fatalf("expected one observation, got %d", len(observer.requests))
+	}
+	got := observer.requests[0]
+	if got.route != "/observed" || got.backend != backend || got.status != http.StatusAccepted {
+		t.Errorf("unexpected observation: %+v", got)
+	}
+	if got.duration <= 0 {
+		t.Errorf("expected positive request duration, got %s", got.duration)
+	}
+}
+
 func TestProxyForwarding(t *testing.T) {
 	var receivedHost, receivedForwardedFor, receivedForwardedHost string
 
