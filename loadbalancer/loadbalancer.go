@@ -349,6 +349,12 @@ func (lb *LoadBalancer) CircuitBreakerState(idx int) circuitbreaker.State {
 	return lb.backends[idx].cb.State()
 }
 
+// CircuitBreakerTrips returns the number of times the backend's circuit breaker
+// has transitioned into the Open state.
+func (lb *LoadBalancer) CircuitBreakerTrips(idx int) uint64 {
+	return lb.backends[idx].cb.Trips()
+}
+
 // ConsecutiveFailures returns the consecutive failure count of the backend at index idx.
 func (lb *LoadBalancer) ConsecutiveFailures(idx int) int {
 	return lb.backends[idx].cb.ConsecutiveFailures()

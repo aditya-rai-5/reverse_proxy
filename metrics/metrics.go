@@ -27,17 +27,19 @@ type histogram struct {
 
 // Metrics contains proxy counters, latency histograms, and backend health.
 type Metrics struct {
-	router  *router.Router
-	mu      sync.Mutex
-	counts  map[requestLabels]uint64
-	latency map[requestLabels]*histogram
+	router              *router.Router
+	mu                  sync.Mutex
+	counts              map[requestLabels]uint64
+	latency             map[requestLabels]*histogram
+	rateLimitRejections map[string]uint64
 }
 
 func New(r *router.Router) *Metrics {
 	return &Metrics{
-		router:  r,
-		counts:  make(map[requestLabels]uint64),
-		latency: make(map[requestLabels]*histogram),
+		router:              r,
+		counts:              make(map[requestLabels]uint64),
+		latency:             make(map[requestLabels]*histogram),
+		rateLimitRejections: make(map[string]uint64),
 	}
 }
 
@@ -72,6 +74,17 @@ func (m *Metrics) ObserveRequest(route, backend string, statusCode int, duration
 	}
 }
 
+// ObserveRateLimitRejection records a request rejected by either the global or
+// a route-level rate limiter. Use "global" for the global limiter.
+func (m *Metrics) ObserveRateLimitRejection(route string) {
+	if route == "" {
+		route = "unknown"
+	}
+	m.mu.Lock()
+	m.rateLimitRejections[route]++
+	m.mu.Unlock()
+}
+
 // Handler returns the Prometheus exposition endpoint. Backend health is
 // sampled from the load balancers each time Prometheus scrapes this endpoint.
 func (m *Metrics) Handler() http.Handler {
@@ -104,6 +117,10 @@ func (m *Metrics) exposition() string {
 		copyOfHistogram.buckets = append([]uint64(nil), value.buckets...)
 		histograms[k] = copyOfHistogram
 	}
+	rejections := make(map[string]uint64, len(m.rateLimitRejections))
+	for route, count := range m.rateLimitRejections {
+		rejections[route] = count
+	}
 	m.mu.Unlock()
 
 	histKeys := make([]requestLabels, 0, len(histograms))
@@ -122,16 +139,42 @@ func (m *Metrics) exposition() string {
 		fmt.Fprintf(&b, "http_request_duration_seconds_count%s %d\n", formatLabels(k, ""), h.count)
 	}
 
+	fmt.Fprintln(&b, "# HELP rate_limit_rejections_total Total number of requests rejected by rate limiters.")
+	fmt.Fprintln(&b, "# TYPE rate_limit_rejections_total counter")
+	rejectionRoutes := make([]string, 0, len(rejections))
+	for route := range rejections {
+		rejectionRoutes = append(rejectionRoutes, route)
+	}
+	sort.Strings(rejectionRoutes)
+	for _, route := range rejectionRoutes {
+		fmt.Fprintf(&b, "rate_limit_rejections_total{route=\"%s\"} %d\n", escape(route), rejections[route])
+	}
+
 	fmt.Fprintln(&b, "# HELP backend_healthy_gauge Whether a backend is healthy (1) or unhealthy (0).")
 	fmt.Fprintln(&b, "# TYPE backend_healthy_gauge gauge")
+	fmt.Fprintln(&b, "# HELP circuit_breaker_state Current circuit breaker state (one-hot: open, half-open, or closed).")
+	fmt.Fprintln(&b, "# TYPE circuit_breaker_state gauge")
+	fmt.Fprintln(&b, "# HELP circuit_breaker_trips_total Total times a backend circuit breaker has opened.")
+	fmt.Fprintln(&b, "# TYPE circuit_breaker_trips_total counter")
 	if m.router != nil {
 		for _, entry := range m.router.Entries() {
 			for i := 0; i < entry.LB.Len(); i++ {
+				backend := entry.LB.BackendURL(i).String()
 				healthy := 0
 				if entry.LB.IsHealthy(i) {
 					healthy = 1
 				}
-				fmt.Fprintf(&b, "backend_healthy_gauge%s %d\n", formatHealthLabels(entry.Path, entry.LB.BackendURL(i).String()), healthy)
+				labels := formatHealthLabels(entry.Path, backend)
+				fmt.Fprintf(&b, "backend_healthy_gauge%s %d\n", labels, healthy)
+				state := string(entry.LB.CircuitBreakerState(i))
+				for _, candidate := range []string{"closed", "half-open", "open"} {
+					value := 0
+					if state == candidate {
+						value = 1
+					}
+					fmt.Fprintf(&b, "circuit_breaker_state{route=\"%s\",backend=\"%s\",state=\"%s\"} %d\n", escape(entry.Path), escape(backend), escape(candidate), value)
+				}
+				fmt.Fprintf(&b, "circuit_breaker_trips_total%s %d\n", labels, entry.LB.CircuitBreakerTrips(i))
 			}
 		}
 	}

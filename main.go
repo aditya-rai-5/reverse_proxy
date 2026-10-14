@@ -37,7 +37,13 @@ func buildHandler(cfg *config.Config, r *router.Router, observers ...proxy.Reque
 			RequestsPerMinute: cfg.RateLimit.RequestsPerMinute,
 			Burst:             cfg.RateLimit.Burst,
 		})
-		handler = rl.Middleware(handler)
+		var onRejected func()
+		if len(observers) > 0 {
+			if rejectionObserver, ok := observers[0].(interface{ ObserveRateLimitRejection(string) }); ok {
+				onRejected = func() { rejectionObserver.ObserveRateLimitRejection("global") }
+			}
+		}
+		handler = rl.Middleware(handler, onRejected)
 	}
 	return handler
 }

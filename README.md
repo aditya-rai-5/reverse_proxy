@@ -159,3 +159,44 @@ go run main.go
 ```bash
 curl http://localhost:8080/healthz
 ```
+
+## One-Click Docker Demo
+
+The Compose demo builds the proxy, starts three mock backends, Prometheus, and
+Grafana, and runs a small traffic generator so the dashboard has live data as
+soon as the stack is healthy. It uses the separate [`demo/config.yaml`](demo/config.yaml)
+and does not change the normal `config.yaml` setup.
+
+```bash
+docker compose up --build
+```
+
+Open [Grafana](http://localhost:3000) and choose **Reverse Proxy Demo** in the
+**Reverse Proxy** folder. Sign in with `admin` / `demo`. The preloaded dashboard
+shows request rate, p50/p95/p99 latency, rate-limit rejections, circuit-breaker
+trips and state, and backend health. Prometheus is also available at
+[localhost:9090](http://localhost:9090), and the proxy is at
+[localhost:8080](http://localhost:8080).
+
+Try the routes directly:
+
+```bash
+curl http://localhost:8080/api/demo
+curl http://localhost:8080/limited/demo
+curl http://localhost:8080/healthz
+```
+
+The generator continuously calls `/api`, `/limited`, and `/breaker`, which fills
+the request and rate-limit panels and repeatedly trips the breaker. Backend3 is
+configured to return HTTP 502 for normal requests while `/health` remains OK,
+so it acts as a controlled failure source without marking the backend unhealthy.
+You can also exercise the failure route directly:
+
+```bash
+curl -i http://localhost:8080/breaker/demo
+```
+
+The breaker panel records the trip while the backend health panel shows backend3
+as reachable. Stop the demo with `Ctrl+C`, or run `docker compose down` in another
+terminal. Add `-v` to `down` if you also want to remove the Prometheus and
+Grafana data volumes.

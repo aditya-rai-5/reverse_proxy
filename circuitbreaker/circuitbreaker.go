@@ -15,8 +15,8 @@ const (
 )
 
 type Config struct {
-	FailureThreshold int `yaml:"failure_threshold"`
-	Cooldown           time.Duration `yaml:"cooldown"`
+	FailureThreshold int           `yaml:"failure_threshold"`
+	Cooldown         time.Duration `yaml:"cooldown"`
 }
 
 func (c *Config) Defaults() {
@@ -35,6 +35,7 @@ type CircuitBreaker struct {
 	config              Config
 	state               State
 	consecutiveFailures int
+	trips               uint64
 	lastStateChange     time.Time
 }
 
@@ -94,10 +95,12 @@ func (cb *CircuitBreaker) RecordFailure() {
 	switch cb.state {
 	case StateHalfOpen:
 		cb.state = StateOpen
+		cb.trips++
 		cb.lastStateChange = now
 	case StateClosed:
 		if cb.consecutiveFailures >= cb.config.FailureThreshold {
 			cb.state = StateOpen
+			cb.trips++
 			cb.lastStateChange = now
 		}
 	case StateOpen:
@@ -122,6 +125,13 @@ func (cb *CircuitBreaker) ConsecutiveFailures() int {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	return cb.consecutiveFailures
+}
+
+// Trips returns the number of times this breaker has transitioned into Open.
+func (cb *CircuitBreaker) Trips() uint64 {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.trips
 }
 
 // Reset clears failure counts and restores the circuit breaker to Closed.

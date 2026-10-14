@@ -42,6 +42,10 @@ type RequestObserver interface {
 	ObserveRequest(route, backend string, statusCode int, duration time.Duration)
 }
 
+type rateLimitRejectionObserver interface {
+	ObserveRateLimitRejection(route string)
+}
+
 // SetRequestObserver installs an optional observer for completed requests.
 func (h *Handler) SetRequestObserver(observer RequestObserver) {
 	h.observer = observer
@@ -109,6 +113,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metricRoute = entry.Path
 
 	if entry.RateLimiter != nil && !entry.RateLimiter.AllowRequest(r) {
+		if observer, ok := h.observer.(rateLimitRejectionObserver); ok {
+			observer.ObserveRateLimitRejection(entry.Path)
+		}
 		log.Printf("[PROXY] rate limit exceeded for route %s from %s", entry.Path, r.RemoteAddr)
 		w.Header().Set("Retry-After", entry.RateLimiter.RetryAfterHeader())
 		http.Error(w, "429 Too Many Requests: rate limit exceeded", http.StatusTooManyRequests)

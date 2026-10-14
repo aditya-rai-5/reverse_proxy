@@ -1,0 +1,83 @@
+services:
+  proxy:
+    build:
+      context: .
+    image: reverse-proxy-demo:local
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./demo/config.yaml:/app/config.yaml:ro
+    depends_on:
+      - backend1
+      - backend2
+      - backend3
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+      start_period: 3s
+
+  backend1:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-listen=:9001", "-text=hello from backend 1"]
+
+  backend2:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-listen=:9002", "-text=hello from backend 2"]
+
+  backend3:
+    image: hashicorp/http-echo:1.0.0
+    # The dedicated /health endpoint still returns 200; regular requests return
+    # 502 so /breaker continuously demonstrates circuit-breaker trips.
+    command: ["-listen=:9003", "-text=controlled backend failure", "-status-code=502"]
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      proxy:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: demo
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  traffic-generator:
+    image: alpine:3.21
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          wget -q -T 2 -O /dev/null http://proxy:8080/api/demo || true
+          wget -q -T 2 -O /dev/null http://proxy:8080/limited/demo || true
+          wget -q -T 2 -O /dev/null http://proxy:8080/breaker/demo || true
+          sleep 1
+        done
+    depends_on:
+      proxy:
+        condition: service_healthy
+
+volumes:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Reverse Proxy Demo
+    orgId: 1
+    folder: Reverse Proxy
+    type: file
+    disableDeletion: true
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

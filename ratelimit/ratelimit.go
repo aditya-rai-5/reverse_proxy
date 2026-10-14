@@ -101,12 +101,15 @@ func (l *Limiter) AllowRequest(r *http.Request) bool {
 }
 
 // Middleware returns an HTTP middleware handler that wraps next, enforcing per-IP rate limits.
-func (l *Limiter) Middleware(next http.Handler) http.Handler {
+func (l *Limiter) Middleware(next http.Handler, onRejected ...func()) http.Handler {
 	if l == nil {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !l.AllowRequest(r) {
+			if len(onRejected) > 0 && onRejected[0] != nil {
+				onRejected[0]()
+			}
 			w.Header().Set("Retry-After", l.RetryAfterHeader())
 			http.Error(w, "429 Too Many Requests: rate limit exceeded", http.StatusTooManyRequests)
 			return
