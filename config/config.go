@@ -99,6 +99,31 @@ type HealthCheck struct {
 	Timeout  time.Duration `yaml:"timeout"`
 }
 
+// TLS configures HTTPS termination. Choose either a certificate/key pair or
+// automatic certificate management with Let's Encrypt.
+type TLS struct {
+	CertFile  string   `yaml:"cert_file,omitempty"`
+	KeyFile   string   `yaml:"key_file,omitempty"`
+	AutoCert  bool     `yaml:"auto_cert,omitempty"`
+	Domains   []string `yaml:"domains,omitempty"`
+	Email     string   `yaml:"email,omitempty"`
+	CacheDir  string   `yaml:"cache_dir,omitempty"`
+	HTTPSPort int      `yaml:"https_port,omitempty"`
+	HTTPPort  int      `yaml:"http_port,omitempty"`
+}
+
+func (t *TLS) defaults() {
+	if t.HTTPSPort == 0 {
+		t.HTTPSPort = 443
+	}
+	if t.HTTPPort == 0 {
+		t.HTTPPort = 80
+	}
+	if t.AutoCert && t.CacheDir == "" {
+		t.CacheDir = ".cache/autocert"
+	}
+}
+
 // defaults fills in zero-value fields with sensible defaults.
 func (hc *HealthCheck) defaults() {
 	if hc.Path == "" {
@@ -115,6 +140,7 @@ func (hc *HealthCheck) defaults() {
 type Config struct {
 	Port                int         `yaml:"port"`
 	MaxRequestBodyBytes int64       `yaml:"max_request_body_bytes"`
+	TLS                 *TLS        `yaml:"tls,omitempty"`
 	RateLimit           *RateLimit  `yaml:"rate_limit,omitempty"`
 	Routes              []Route     `yaml:"routes"`
 	HealthCheck         HealthCheck `yaml:"health_check"`
@@ -152,6 +178,34 @@ func validate(cfg *Config) error {
 	}
 	if cfg.MaxRequestBodyBytes == 0 {
 		cfg.MaxRequestBodyBytes = DefaultMaxRequestBodyBytes
+	}
+	if cfg.TLS != nil {
+		cfg.TLS.defaults()
+		if cfg.TLS.HTTPSPort < 1 || cfg.TLS.HTTPSPort > 65535 {
+			return fmt.Errorf("tls.https_port must be between 1 and 65535")
+		}
+		if cfg.TLS.HTTPPort < 1 || cfg.TLS.HTTPPort > 65535 {
+			return fmt.Errorf("tls.http_port must be between 1 and 65535")
+		}
+		if cfg.TLS.HTTPPort == cfg.TLS.HTTPSPort {
+			return fmt.Errorf("tls.http_port and tls.https_port must be different")
+		}
+		if cfg.TLS.AutoCert {
+			if cfg.TLS.CertFile != "" || cfg.TLS.KeyFile != "" {
+				return fmt.Errorf("tls: cert_file/key_file cannot be combined with auto_cert")
+			}
+			if len(cfg.TLS.Domains) == 0 {
+				return fmt.Errorf("tls.domains must contain at least one domain when auto_cert is enabled")
+			}
+			for i, domain := range cfg.TLS.Domains {
+				if strings.TrimSpace(domain) != domain || domain == "" ||
+					strings.ContainsAny(domain, " \t\r\n/:*") || !strings.Contains(domain, ".") {
+					return fmt.Errorf("tls.domains[%d] must be a hostname without a scheme, port, or wildcard", i)
+				}
+			}
+		} else if cfg.TLS.CertFile == "" || cfg.TLS.KeyFile == "" {
+			return fmt.Errorf("tls.cert_file and tls.key_file are both required unless auto_cert is enabled")
+		}
 	}
 	if cfg.RateLimit != nil {
 		if cfg.RateLimit.RequestsPerMinute < 0 {

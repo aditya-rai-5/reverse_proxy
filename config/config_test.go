@@ -381,6 +381,98 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestValidateTLSModesAndDefaults(t *testing.T) {
+	t.Run("manual certificate defaults listener ports", func(t *testing.T) {
+		cfg := &Config{
+			Port:   8080,
+			TLS:    &TLS{CertFile: "server.crt", KeyFile: "server.key"},
+			Routes: []Route{{Path: "/", Backends: []Backend{{URL: "http://localhost"}}}},
+		}
+		if err := validate(cfg); err != nil {
+			t.Fatalf("validate returned error: %v", err)
+		}
+		if cfg.TLS.HTTPPort != 80 || cfg.TLS.HTTPSPort != 443 {
+			t.Fatalf("expected HTTP/HTTPS ports 80/443, got %d/%d", cfg.TLS.HTTPPort, cfg.TLS.HTTPSPort)
+		}
+	})
+
+	t.Run("autocert defaults cache and listener ports", func(t *testing.T) {
+		cfg := &Config{
+			Port:   8080,
+			TLS:    &TLS{AutoCert: true, Domains: []string{"proxy.example.com"}},
+			Routes: []Route{{Path: "/", Backends: []Backend{{URL: "http://localhost"}}}},
+		}
+		if err := validate(cfg); err != nil {
+			t.Fatalf("validate returned error: %v", err)
+		}
+		if cfg.TLS.HTTPPort != 80 || cfg.TLS.HTTPSPort != 443 || cfg.TLS.CacheDir == "" {
+			t.Fatalf("unexpected autocert defaults: %+v", cfg.TLS)
+		}
+	})
+}
+
+func TestLoadTLSConfig(t *testing.T) {
+	yamlData := []byte(`
+port: 8080
+tls:
+  auto_cert: true
+  domains:
+    - proxy.example.com
+  email: admin@example.com
+  cache_dir: /tmp/proxy-certs
+  http_port: 8081
+  https_port: 8443
+routes:
+  - path: /
+    backends:
+      - url: http://localhost:9000
+`)
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, yamlData, 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.TLS == nil || !cfg.TLS.AutoCert {
+		t.Fatal("expected autocert configuration to be loaded")
+	}
+	if cfg.TLS.HTTPSPort != 8443 || cfg.TLS.HTTPPort != 8081 || cfg.TLS.CacheDir != "/tmp/proxy-certs" {
+		t.Fatalf("unexpected TLS config: %+v", cfg.TLS)
+	}
+	if len(cfg.TLS.Domains) != 1 || cfg.TLS.Domains[0] != "proxy.example.com" {
+		t.Fatalf("unexpected TLS domains: %v", cfg.TLS.Domains)
+	}
+}
+
+func TestValidateRejectsInvalidTLSConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		tls  *TLS
+	}{
+		{name: "incomplete manual certificate", tls: &TLS{CertFile: "server.crt"}},
+		{name: "autocert without domains", tls: &TLS{AutoCert: true}},
+		{name: "manual and automatic certificates combined", tls: &TLS{AutoCert: true, Domains: []string{"proxy.example.com"}, CertFile: "server.crt", KeyFile: "server.key"}},
+		{name: "same HTTP and HTTPS port", tls: &TLS{CertFile: "server.crt", KeyFile: "server.key", HTTPPort: 8443, HTTPSPort: 8443}},
+		{name: "invalid HTTPS port", tls: &TLS{CertFile: "server.crt", KeyFile: "server.key", HTTPSPort: 70000}},
+		{name: "empty autocert domain", tls: &TLS{AutoCert: true, Domains: []string{"  "}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Port:   8080,
+				TLS:    tt.tls,
+				Routes: []Route{{Path: "/", Backends: []Backend{{URL: "http://localhost"}}}},
+			}
+			if err := validate(cfg); err == nil {
+				t.Fatal("expected invalid TLS configuration to be rejected")
+			}
+		})
+	}
+}
+
 func TestLoadConfigRetriesAndCircuitBreaker(t *testing.T) {
 	yamlData := []byte(`
 port: 8080

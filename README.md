@@ -21,6 +21,7 @@ A fast, production-style HTTP reverse proxy with path-based routing, path stripp
 - **Header Forwarding:** Automatically preserves and forwards `X-Forwarded-For` and `X-Forwarded-Host`.
 - **Healthz Endpoint:** Exposes `GET /healthz` returning JSON status of all backends (including health status, weight, active in-flight connections, circuit breaker state, consecutive failures, and route algorithm).
 - **Graceful Shutdown:** Catches `SIGINT`/`SIGTERM` and drains in-flight requests with a 10-second timeout.
+- **HTTPS Termination:** Serve HTTPS using a configured certificate/key pair or automatically provision and renew Let's Encrypt certificates with `autocert`. TLS mode redirects ordinary HTTP traffic to HTTPS and leaves ACME HTTP-01 challenge paths available.
 
 ## Configuration
 
@@ -91,6 +92,35 @@ routes:
     backends:
       - url: "http://localhost:9000"
 ```
+
+### HTTPS with certificate files
+
+Add a `tls` section to terminate TLS in the proxy. HTTPS listens on port `443` and HTTP redirects from port `80` by default; both ports can be changed for local development or deployments behind a port mapper.
+
+```yaml
+tls:
+  cert_file: "/etc/reverse-proxy/tls/fullchain.pem"
+  key_file: "/etc/reverse-proxy/tls/privkey.pem"
+  https_port: 443
+  http_port: 80
+```
+
+### Let's Encrypt automatic certificates
+
+Set `auto_cert: true`, list the exact domain names this proxy serves, and keep the cache directory on persistent storage. DNS for each domain must point to this host, and the configured HTTP/HTTPS ports must be reachable by Let's Encrypt (normally ports 80 and 443).
+
+```yaml
+tls:
+  auto_cert: true
+  domains:
+    - "proxy.example.com"
+  email: "admin@example.com"
+  cache_dir: "/var/lib/reverse-proxy/autocert"
+  https_port: 443
+  http_port: 80
+```
+
+Use either `cert_file` plus `key_file` or `auto_cert`, not both. Without a `tls` section, the existing plain HTTP listener on `port` is used.
 
 ## Running Tests
 

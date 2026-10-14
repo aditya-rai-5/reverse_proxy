@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -17,6 +21,7 @@ import (
 	"github.com/aditya-rai-5/reverse_proxy/proxy"
 	"github.com/aditya-rai-5/reverse_proxy/ratelimit"
 	"github.com/aditya-rai-5/reverse_proxy/router"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // buildHandler creates the proxy handler and applies the global rate limiting middleware if configured.
@@ -58,29 +63,134 @@ func main() {
 	mux.Handle("/", handler)
 	mux.HandleFunc("/healthz", makeHealthzHandler(r, cfg))
 
-	addr := fmt.Sprintf(":%d", cfg.Port)
-	srv := &http.Server{Addr: addr, Handler: mux}
-
-	log.Printf("Reverse proxy listening on %s (health check: path=%s interval=%s timeout=%s)",
-		addr, cfg.HealthCheck.Path, cfg.HealthCheck.Interval, cfg.HealthCheck.Timeout)
-
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
+	servers, err := newServers(cfg, mux)
+	if err != nil {
+		log.Fatalf("failed to configure listeners: %v", err)
+	}
+	for _, srv := range servers.all() {
+		protocol := "HTTP"
+		if srv.TLSConfig != nil {
+			protocol = "HTTPS"
 		}
-	}()
+		log.Printf("Reverse proxy %s listener on %s", protocol, srv.Addr)
+		go func(srv *http.Server) {
+			if err := serve(srv); err != nil && err != http.ErrServerClosed {
+				log.Printf("server error on %s: %v", srv.Addr, err)
+				cancel()
+			}
+		}(srv)
+	}
+	log.Printf("Health check: path=%s interval=%s timeout=%s",
+		cfg.HealthCheck.Path, cfg.HealthCheck.Interval, cfg.HealthCheck.Timeout)
 
 	<-ctx.Done()
 	log.Println("Shutting down…")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("graceful shutdown error: %v", err)
+	for _, srv := range servers.all() {
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown error for %s: %v", srv.Addr, err)
+		}
 	}
 
 	hcWg.Wait()
 	log.Println("All health checkers stopped. Bye!")
+}
+
+type serverPair struct {
+	app         *http.Server
+	redirect    *http.Server
+	certManager *autocert.Manager
+}
+
+func (s *serverPair) all() []*http.Server {
+	servers := []*http.Server{s.app}
+	if s.redirect != nil {
+		servers = append(servers, s.redirect)
+	}
+	return servers
+}
+
+func newServers(cfg *config.Config, handler http.Handler) (*serverPair, error) {
+	if cfg.TLS == nil {
+		return &serverPair{app: &http.Server{
+			Addr:    fmt.Sprintf(":%d", cfg.Port),
+			Handler: handler,
+		}}, nil
+	}
+
+	tlsCfg := cfg.TLS
+	serverTLS := &tls.Config{MinVersion: tls.VersionTLS12}
+	var manager *autocert.Manager
+	if tlsCfg.AutoCert {
+		manager = &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			Cache:      autocert.DirCache(tlsCfg.CacheDir),
+			HostPolicy: autocert.HostWhitelist(tlsCfg.Domains...),
+			Email:      tlsCfg.Email,
+		}
+		serverTLS = manager.TLSConfig()
+		serverTLS.MinVersion = tls.VersionTLS12
+	} else {
+		cert, err := tls.LoadX509KeyPair(tlsCfg.CertFile, tlsCfg.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load TLS certificate/key: %w", err)
+		}
+		serverTLS.Certificates = []tls.Certificate{cert}
+	}
+
+	redirectHandler := httpsRedirectHandler(tlsCfg.HTTPSPort)
+	if manager != nil {
+		// autocert's HTTP handler serves HTTP-01 challenges before delegating
+		// normal requests to our HTTPS redirect handler.
+		redirectHandler = manager.HTTPHandler(redirectHandler)
+	}
+
+	return &serverPair{
+		app: &http.Server{
+			Addr:      fmt.Sprintf(":%d", tlsCfg.HTTPSPort),
+			Handler:   handler,
+			TLSConfig: serverTLS,
+		},
+		redirect: &http.Server{
+			Addr:    fmt.Sprintf(":%d", tlsCfg.HTTPPort),
+			Handler: redirectHandler,
+		},
+		certManager: manager,
+	}, nil
+}
+
+func serve(srv *http.Server) error {
+	if srv.TLSConfig != nil {
+		return srv.ListenAndServeTLS("", "")
+	}
+	return srv.ListenAndServe()
+}
+
+func httpsRedirectHandler(httpsPort int) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		target := *r.URL
+		target.Scheme = "https"
+		target.Host = httpsAuthority(r.Host, httpsPort)
+		http.Redirect(w, r, target.String(), http.StatusPermanentRedirect)
+	})
+}
+
+func httpsAuthority(hostport string, httpsPort int) string {
+	host := hostport
+	if parsedHost, _, err := net.SplitHostPort(hostport); err == nil {
+		host = parsedHost
+	} else {
+		host = strings.TrimPrefix(strings.TrimSuffix(hostport, "]"), "[")
+	}
+	if httpsPort == 443 {
+		if strings.Contains(host, ":") {
+			return "[" + host + "]"
+		}
+		return host
+	}
+	return net.JoinHostPort(host, strconv.Itoa(httpsPort))
 }
 
 // backendStatus is the JSON shape returned by /healthz.
