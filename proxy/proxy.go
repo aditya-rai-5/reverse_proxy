@@ -96,14 +96,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if maxAttempts <= 0 {
 		maxAttempts = 1
 	}
-	canRetry := isIdempotentMethod(r.Method)
-	if !canRetry {
-		maxAttempts = 1
-	}
 
 	var bodyBytes []byte
 	bufferedBody := false
-	if r.Body != nil && entry.Retries > 0 && canRetry {
+	if r.Body != nil && entry.Retries > 0 {
 		// Read at most one byte past the retry-buffer limit. If the body is too
 		// large to replay safely, restore the consumed prefix and stream it once.
 		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, h.maxRequestBodyBytes+1))
@@ -229,16 +225,6 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	_, _ = io.Copy(w, resp.Body)
 
 	return true, resp.StatusCode, nil
-}
-
-// isIdempotentMethod identifies methods that can be retried on another backend.
-func isIdempotentMethod(method string) bool {
-	switch method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete:
-		return true
-	default:
-		return false
-	}
 }
 
 func removeHopByHopHeaders(h http.Header) {
