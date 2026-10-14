@@ -21,7 +21,7 @@ import (
 
 // buildHandler creates the proxy handler and applies the global rate limiting middleware if configured.
 func buildHandler(cfg *config.Config, r *router.Router) http.Handler {
-	var handler http.Handler = proxy.New(r)
+	var handler http.Handler = proxy.NewWithTransportAndBodyLimit(r, nil, cfg.MaxRequestBodyBytes)
 	if cfg.RateLimit != nil && cfg.RateLimit.Enabled() {
 		rl := ratelimit.New(ratelimit.Config{
 			RequestsPerMinute: cfg.RateLimit.RequestsPerMinute,

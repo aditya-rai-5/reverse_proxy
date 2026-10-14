@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aditya-rai-5/reverse_proxy/config"
 	"github.com/aditya-rai-5/reverse_proxy/loadbalancer"
 	"github.com/aditya-rai-5/reverse_proxy/router"
 )
@@ -29,13 +30,18 @@ var hopByHopHeaders = []string{
 
 // Handler is the top-level HTTP handler for the reverse proxy.
 type Handler struct {
-	router    *router.Router
-	transport http.RoundTripper
+	router              *router.Router
+	transport           http.RoundTripper
+	maxRequestBodyBytes int64
 }
 
 // New creates a Handler backed by the given router using standard production transport.
 func New(r *router.Router) *Handler {
-	return NewWithTransport(r, &http.Transport{
+	return NewWithTransportAndBodyLimit(r, nil, config.DefaultMaxRequestBodyBytes)
+}
+
+func defaultTransport() *http.Transport {
+	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -46,14 +52,28 @@ func New(r *router.Router) *Handler {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-	})
+	}
 }
 
 // NewWithTransport creates a Handler with a custom RoundTripper (useful for testing).
 func NewWithTransport(r *router.Router, transport http.RoundTripper) *Handler {
+	return NewWithTransportAndBodyLimit(r, transport, config.DefaultMaxRequestBodyBytes)
+}
+
+// NewWithTransportAndBodyLimit creates a Handler with a custom RoundTripper and
+// a maximum request body size to retain for retries. Larger bodies are streamed
+// to one backend without retries.
+func NewWithTransportAndBodyLimit(r *router.Router, transport http.RoundTripper, maxRequestBodyBytes int64) *Handler {
+	if maxRequestBodyBytes <= 0 {
+		maxRequestBodyBytes = config.DefaultMaxRequestBodyBytes
+	}
+	if transport == nil {
+		transport = defaultTransport()
+	}
 	return &Handler{
-		router:    r,
-		transport: transport,
+		router:              r,
+		transport:           transport,
+		maxRequestBodyBytes: maxRequestBodyBytes,
 	}
 }
 
@@ -72,20 +92,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	maxAttempts := 1 + entry.Retries
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	canRetry := isIdempotentMethod(r.Method)
+	if !canRetry {
+		maxAttempts = 1
+	}
+
 	var bodyBytes []byte
-	if r.Body != nil {
-		bodyBytes, err = io.ReadAll(r.Body)
+	bufferedBody := false
+	if r.Body != nil && entry.Retries > 0 && canRetry {
+		// Read at most one byte past the retry-buffer limit. If the body is too
+		// large to replay safely, restore the consumed prefix and stream it once.
+		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, h.maxRequestBodyBytes+1))
 		if err != nil {
+			_ = r.Body.Close()
 			log.Printf("[PROXY] error reading request body: %v", err)
 			http.Error(w, "400 Bad Request: failed to read request body", http.StatusBadRequest)
 			return
 		}
-		_ = r.Body.Close()
-	}
-
-	maxAttempts := 1 + entry.Retries
-	if maxAttempts <= 0 {
-		maxAttempts = 1
+		if int64(len(bodyBytes)) > h.maxRequestBodyBytes {
+			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(bodyBytes), r.Body))
+			bodyBytes = nil
+			maxAttempts = 1
+		} else {
+			_ = r.Body.Close()
+			bufferedBody = true
+		}
 	}
 
 	excluded := make(map[string]bool)
@@ -111,7 +146,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		target := result.URL
 		excluded[target.String()] = true
 
-		success, statusCode, err := h.forward(w, r, entry, result, bodyBytes)
+		success, statusCode, err := h.forward(w, r, entry, result, bodyBytes, bufferedBody)
 		if success {
 			entry.LB.RecordSuccess(target)
 			return
@@ -132,7 +167,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.Entry, result *loadbalancer.Result, bodyBytes []byte) (bool, int, error) {
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.Entry, result *loadbalancer.Result, bodyBytes []byte, bufferedBody bool) (bool, int, error) {
 	if result.Done != nil {
 		defer result.Done()
 	}
@@ -154,13 +189,11 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	outReq.URL.RawPath = ""
 	outReq.RequestURI = ""
 
-	if len(bodyBytes) > 0 {
+	if bufferedBody {
 		outReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		outReq.GetBody = func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
 		}
-	} else {
-		outReq.Body = nil
 	}
 
 	removeHopByHopHeaders(outReq.Header)
@@ -196,6 +229,16 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	_, _ = io.Copy(w, resp.Body)
 
 	return true, resp.StatusCode, nil
+}
+
+// isIdempotentMethod identifies methods that can be retried on another backend.
+func isIdempotentMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
 }
 
 func removeHopByHopHeaders(h http.Header) {

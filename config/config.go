@@ -49,8 +49,8 @@ type RewriteRule struct {
 
 // CircuitBreakerConfig holds settings for backend failure detection and recovery.
 type CircuitBreakerConfig struct {
-	FailureThreshold int `yaml:"failure_threshold"`
-	Cooldown           time.Duration `yaml:"cooldown"`
+	FailureThreshold int           `yaml:"failure_threshold"`
+	Cooldown         time.Duration `yaml:"cooldown"`
 }
 
 // Defaults fills in zero-value fields with sensible defaults.
@@ -113,11 +113,14 @@ func (hc *HealthCheck) defaults() {
 }
 
 type Config struct {
-	Port        int         `yaml:"port"`
-	RateLimit   *RateLimit  `yaml:"rate_limit,omitempty"`
-	Routes      []Route     `yaml:"routes"`
-	HealthCheck HealthCheck `yaml:"health_check"`
+	Port                int         `yaml:"port"`
+	MaxRequestBodyBytes int64       `yaml:"max_request_body_bytes"`
+	RateLimit           *RateLimit  `yaml:"rate_limit,omitempty"`
+	Routes              []Route     `yaml:"routes"`
+	HealthCheck         HealthCheck `yaml:"health_check"`
 }
+
+const DefaultMaxRequestBodyBytes int64 = 10 << 20 // 10 MiB
 
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -143,6 +146,12 @@ func Load(path string) (*Config, error) {
 func validate(cfg *Config) error {
 	if cfg.Port == 0 {
 		return fmt.Errorf("port must be specified")
+	}
+	if cfg.MaxRequestBodyBytes < 0 {
+		return fmt.Errorf("max_request_body_bytes must be non-negative")
+	}
+	if cfg.MaxRequestBodyBytes == 0 {
+		cfg.MaxRequestBodyBytes = DefaultMaxRequestBodyBytes
 	}
 	if cfg.RateLimit != nil {
 		if cfg.RateLimit.RequestsPerMinute < 0 {
