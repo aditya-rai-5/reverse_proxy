@@ -222,11 +222,12 @@ type rateLimitStatus struct {
 }
 
 type routeStatus struct {
-	Path      string           `json:"path"`
-	Algorithm string           `json:"algorithm,omitempty"`
-	Retries   int              `json:"retries,omitempty"`
-	RateLimit *rateLimitStatus `json:"rate_limit,omitempty"`
-	Backends  []backendStatus  `json:"backends"`
+	Path         string           `json:"path"`
+	Algorithm    string           `json:"algorithm,omitempty"`
+	Retries      int              `json:"retries,omitempty"`
+	RetryMethods []string         `json:"retry_methods"`
+	RateLimit    *rateLimitStatus `json:"rate_limit,omitempty"`
+	Backends     []backendStatus  `json:"backends"`
 }
 
 // makeHealthzHandler returns an HTTP handler that reports the health of every
@@ -254,10 +255,11 @@ func makeHealthzHandler(r *router.Router, cfg ...*config.Config) http.HandlerFun
 				})
 			}
 			rs := routeStatus{
-				Path:      entry.Path,
-				Algorithm: entry.LB.Algorithm(),
-				Retries:   entry.Retries,
-				Backends:  bs,
+				Path:         entry.Path,
+				Algorithm:    entry.LB.Algorithm(),
+				Retries:      entry.Retries,
+				RetryMethods: entry.RetryMethods,
+				Backends:     bs,
 			}
 			if entry.RateLimiter != nil {
 				rs.RateLimit = &rateLimitStatus{

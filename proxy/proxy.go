@@ -28,6 +28,10 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
+// StatusClientClosedRequest is the conventional status used for canceled client
+// requests in observations. A disconnected client may not receive the response.
+const StatusClientClosedRequest = 499
+
 // Handler is the top-level HTTP handler for the reverse proxy.
 type Handler struct {
 	router              *router.Router
@@ -98,11 +102,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tracked := &statusResponseWriter{ResponseWriter: w}
 	w = tracked
 	metricRoute, metricBackend := "unmatched", ""
+	metricStatus := 0
 	defer func() {
 		if h.observer != nil {
-			h.observer.ObserveRequest(metricRoute, metricBackend, tracked.statusCode(), time.Since(started))
+			if metricStatus == 0 {
+				metricStatus = tracked.statusCode()
+			}
+			h.observer.ObserveRequest(metricRoute, metricBackend, metricStatus, time.Since(started))
 		}
 	}()
+	stopIfCanceled := func() bool {
+		if err := r.Context().Err(); err != nil {
+			metricStatus = StatusClientClosedRequest
+			message := "499 Client Closed Request"
+			if errors.Is(err, context.DeadlineExceeded) {
+				metricStatus = http.StatusGatewayTimeout
+				message = "504 Gateway Timeout: client request deadline exceeded"
+			}
+			if tracked.status == 0 {
+				http.Error(w, message, metricStatus)
+			}
+			return true
+		}
+		return false
+	}
+	if stopIfCanceled() {
+		return
+	}
 
 	entry, err := h.router.Match(r.URL.Path)
 	if err != nil {
@@ -122,17 +148,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maxAttempts := 1 + entry.Retries
+	maxAttempts := 1
+	if entry.Retries > 0 && entry.CanRetry(r) {
+		maxAttempts += entry.Retries
+	}
 	if maxAttempts <= 0 {
 		maxAttempts = 1
 	}
 
 	var bodyBytes []byte
 	bufferedBody := false
-	if r.Body != nil && entry.Retries > 0 {
+	if r.Body != nil && maxAttempts > 1 {
 		// Read at most one byte past the retry-buffer limit. If the body is too
 		// large to replay safely, restore the consumed prefix and stream it once.
 		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, h.maxRequestBodyBytes+1))
+		if stopIfCanceled() {
+			_ = r.Body.Close()
+			return
+		}
 		if err != nil {
 			_ = r.Body.Close()
 			log.Printf("[PROXY] error reading request body: %v", err)
@@ -140,7 +173,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if int64(len(bodyBytes)) > h.maxRequestBodyBytes {
-			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(bodyBytes), r.Body))
+			r.Body = struct {
+				io.Reader
+				io.Closer
+			}{io.MultiReader(bytes.NewReader(bodyBytes), r.Body), r.Body}
 			bodyBytes = nil
 			maxAttempts = 1
 		} else {
@@ -154,6 +190,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var lastStatusCode int
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if stopIfCanceled() {
+			return
+		}
 		result, err := entry.SelectExcluding(r, excluded)
 		if err != nil {
 			if errors.Is(err, loadbalancer.ErrNoHealthyBackend) {
@@ -173,7 +212,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		metricBackend = target.String()
 		excluded[target.String()] = true
 
-		success, statusCode, err := h.forward(w, r, entry, result, bodyBytes, bufferedBody)
+		success, statusCode, err := h.forward(w, r, entry, result, bodyBytes, bufferedBody, maxAttempts > 1)
+		// A route timeout leaves the original request context alive. Only client
+		// cancellation/deadline stops retries without blaming the backend.
+		if stopIfCanceled() {
+			return
+		}
 		if success {
 			entry.LB.RecordSuccess(target)
 			return
@@ -182,8 +226,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		entry.LB.RecordFailure(target)
 		lastErr = err
 		lastStatusCode = statusCode
-		log.Printf("[PROXY] attempt %d on %s failed (status=%d, err=%v), retrying on next backend...",
+		log.Printf("[PROXY] attempt %d on %s failed (status=%d, err=%v)",
 			attempt+1, target.Host, statusCode, err)
+	}
+	if stopIfCanceled() {
+		return
 	}
 
 	log.Printf("[PROXY] all retry attempts failed for %s: lastErr=%v, lastStatus=%d", r.URL.Path, lastErr, lastStatusCode)
@@ -224,7 +271,7 @@ func (w *statusResponseWriter) statusCode() int {
 
 func (w *statusResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.Entry, result *loadbalancer.Result, bodyBytes []byte, bufferedBody bool) (bool, int, error) {
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.Entry, result *loadbalancer.Result, bodyBytes []byte, bufferedBody, allowReplay bool) (bool, int, error) {
 	if result.Done != nil {
 		defer result.Done()
 	}
@@ -250,6 +297,15 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 		outReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		outReq.GetBody = func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+		}
+	}
+	if !allowReplay {
+		// net/http.Transport also retries some connection failures when it sees
+		// an Idempotency-Key. Hide replayability even for empty bodies so that
+		// a client header alone cannot bypass the route policy or body limit.
+		outReq.GetBody = nil
+		if outReq.Body == nil || outReq.Body == http.NoBody {
+			outReq.Body = io.NopCloser(bytes.NewReader(nil))
 		}
 	}
 

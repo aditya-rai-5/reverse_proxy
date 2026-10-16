@@ -19,6 +19,8 @@ routes:
     strip_prefix: "/api"
     algorithm: "weighted_round_robin"
     retries: 2
+    # Defaults to read-only retries. Writes additionally require backend deduplication.
+    retry_methods: [GET, HEAD, OPTIONS]
     timeout: 3s
     circuit_breaker:
       failure_threshold: 5 

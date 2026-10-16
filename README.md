@@ -13,7 +13,7 @@ A fast, production-style HTTP reverse proxy with path-based routing, path stripp
   - **IP Hash (`ip_hash`):** Deterministic hashing of client IP (from `RemoteAddr` or `X-Forwarded-For`), pinning clients to backends with automatic failover.
   - **Sticky Sessions (`sticky`):** Cookie-based session persistence (configurable `cookie_name`) ensuring subsequent user requests stay on the same backend, with automatic health failover.
 - **Rate Limiting Middleware:** Protects backends from abuse using the token bucket algorithm (`golang.org/x/time/rate`). Enforces per-IP limits configured in YAML (globally or per-route via `requests_per_minute` and `burst`). Returns HTTP `429 Too Many Requests` with a `Retry-After` header when exceeded, with automatic background TTL cleanup of inactive client IP entries.
-- **Automatic Request Retries:** Requests can retry on another backend after an upstream `502`, `504`, connection error, or timeout.
+- **Safe Request Retries:** By default only `GET`, `HEAD`, and `OPTIONS` retry after an upstream `502`, `504`, connection error, or per-attempt timeout. Write retries require route opt-in and an `Idempotency-Key` enforced by the backends. Client cancellation stops retries without counting as a backend failure.
 - **Bounded Retry Buffering:** Request bodies up to `max_request_body_bytes` (10 MiB by default) are retained for retries. Larger bodies are streamed to one backend without retries.
 - **Circuit Breaking:** Tracks consecutive failures per backend. If a backend fails 5 consecutive times (configurable `failure_threshold`), the circuit breaker trips **Open**, immediately skipping the backend for subsequent client requests so clients are not slowed down. Automatically transitions to **Half-Open** after a cooldown period (`cooldown`) to test backend recovery.
 - **Active Health Checks:** Periodic background HTTP probing of all upstream backends with automatic failure detection and recovery.
@@ -47,7 +47,8 @@ routes:
   - path: "/api"
     strip_prefix: "/api"
     algorithm: "weighted_round_robin"
-    retries: 2             # Retry up to 2 times on other healthy backends
+    retries: 2             # Retry eligible requests on other healthy backends
+    retry_methods: [GET, HEAD, OPTIONS] # Defaults; writes require explicit opt-in
     timeout: 3s            # Per-attempt request timeout
     circuit_breaker:
       failure_threshold: 5 # Trip breaker Open after 5 consecutive failures
@@ -93,6 +94,46 @@ routes:
     backends:
       - url: "http://localhost:9000"
 ```
+
+### Retry safety
+
+`retries` sets the retry budget. `retry_methods` selects which methods may use
+that budget and defaults to `[GET, HEAD, OPTIONS]`. An explicit empty list
+(`retry_methods: []`) disables proxy retries for the route. A configured list
+replaces the default rather than extending it. Existing configurations keep
+read-method failover; POST, PATCH, PUT, and DELETE are forwarded once by default.
+
+To retry a write method, include it explicitly:
+
+```yaml
+routes:
+  - path: "/payments"
+    retries: 1
+    retry_methods: [GET, HEAD, OPTIONS, POST]
+    backends:
+      - url: "http://payments-1:9001"
+      - url: "http://payments-2:9002"
+```
+
+POST, PATCH, PUT, and DELETE also require exactly one non-empty
+`Idempotency-Key` request header. Without it, even an opted-in write is forwarded
+once. The same key and buffered body are forwarded on each attempt. A key alone
+does not enable retries on a route that has not opted in. Unknown retry methods
+are rejected during configuration loading/router construction.
+
+Only enable write retries when **all backends share durable, atomic
+deduplication for the key**, bind it to the operation/payload, and retain the
+result long enough for retries. The proxy checks eligibility and preserves the
+key; it does not store keys or deduplicate application writes. Larger bodies
+still stream once without retries, regardless of method/key eligibility.
+
+Cancellation is checked before forwarding and after each attempt. It stops
+retries and leaves backend failure counters unchanged. Observations use `499`
+for client cancellation and `504` for an expired client request deadline;
+disconnected clients may not receive those responses. A route's per-attempt
+timeout can still count as an upstream failure and retry while the original
+request context remains active. Once response headers have been sent, no error
+body is appended on cancellation.
 
 ### HTTPS with certificate files
 

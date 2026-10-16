@@ -86,10 +86,35 @@ type Route struct {
 	Algorithm      string                `yaml:"algorithm,omitempty"`
 	CookieName     string                `yaml:"cookie_name,omitempty"`
 	Retries        int                   `yaml:"retries,omitempty"`
+	RetryMethods   []string              `yaml:"retry_methods"`
 	Timeout        time.Duration         `yaml:"timeout,omitempty"`
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuit_breaker,omitempty"`
 	RateLimit      *RateLimit            `yaml:"rate_limit,omitempty"`
 	Backends       []Backend             `yaml:"backends"`
+}
+
+// NormalizeRetryMethods supplies a conservative default when omitted. An
+// explicitly empty list disables retries; write methods require an idempotency
+// key at request time as well as inclusion in this list.
+func NormalizeRetryMethods(methods []string) ([]string, error) {
+	if methods == nil {
+		return []string{"GET", "HEAD", "OPTIONS"}, nil
+	}
+	normalized := make([]string, 0, len(methods))
+	seen := make(map[string]bool)
+	for _, method := range methods {
+		method = strings.ToUpper(strings.TrimSpace(method))
+		switch method {
+		case "GET", "HEAD", "OPTIONS", "PUT", "DELETE", "POST", "PATCH":
+		default:
+			return nil, fmt.Errorf("unsupported retry method %q", method)
+		}
+		if !seen[method] {
+			normalized = append(normalized, method)
+			seen[method] = true
+		}
+	}
+	return normalized, nil
 }
 
 // HealthCheck holds configuration for backend health probing.
@@ -273,6 +298,10 @@ func validate(cfg *Config) error {
 
 		if route.Retries < 0 {
 			return fmt.Errorf("route[%d]: retries must be non-negative", i)
+		}
+		route.RetryMethods, err = NormalizeRetryMethods(route.RetryMethods)
+		if err != nil {
+			return fmt.Errorf("route[%d]: %w", i, err)
 		}
 		if route.Retries == 0 && len(route.Backends) > 1 {
 			route.Retries = len(route.Backends) - 1

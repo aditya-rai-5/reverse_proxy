@@ -16,14 +16,36 @@ import (
 )
 
 type Entry struct {
-	Path        string
-	StripPrefix string
-	LB          *loadbalancer.LoadBalancer
-	Retries     int
-	Timeout     time.Duration
-	RateLimiter *ratelimit.Limiter
-	rewriteRe   *regexp.Regexp
-	replacement string
+	Path         string
+	StripPrefix  string
+	LB           *loadbalancer.LoadBalancer
+	Retries      int
+	RetryMethods []string
+	Timeout      time.Duration
+	RateLimiter  *ratelimit.Limiter
+	rewriteRe    *regexp.Regexp
+	replacement  string
+}
+
+// CanRetry requires route opt-in and a single nonempty Idempotency-Key for write
+// methods.
+func (e *Entry) CanRetry(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	for _, method := range e.RetryMethods {
+		if method != req.Method {
+			continue
+		}
+		switch method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			return true
+		default:
+			keys := req.Header.Values("Idempotency-Key")
+			return len(keys) == 1 && strings.TrimSpace(keys[0]) != ""
+		}
+	}
+	return false
 }
 
 // Next selects the next healthy backend from the entry's load balancer.
@@ -73,6 +95,11 @@ func New(cfg *config.Config) (*Router, error) {
 	entries := make([]Entry, 0, len(cfg.Routes))
 
 	for _, route := range cfg.Routes {
+		// Also validate/default programmatic configs that bypass config.Load.
+		retryMethods, err := config.NormalizeRetryMethods(route.RetryMethods)
+		if err != nil {
+			return nil, fmt.Errorf("route %q: %w", route.Path, err)
+		}
 		opts := []loadbalancer.Option{
 			loadbalancer.WithAlgorithm(route.Algorithm),
 			loadbalancer.WithCookieName(route.CookieName),
@@ -98,12 +125,13 @@ func New(cfg *config.Config) (*Router, error) {
 		}
 
 		entry := Entry{
-			Path:        route.Path,
-			StripPrefix: route.StripPrefix,
-			LB:          lb,
-			Retries:     route.Retries,
-			Timeout:     route.Timeout,
-			RateLimiter: rl,
+			Path:         route.Path,
+			StripPrefix:  route.StripPrefix,
+			LB:           lb,
+			Retries:      route.Retries,
+			RetryMethods: retryMethods,
+			Timeout:      route.Timeout,
+			RateLimiter:  rl,
 		}
 
 		if route.Rewrite != nil {

@@ -830,8 +830,9 @@ func TestProxyRetryWithRequestBody(t *testing.T) {
 		Port: 8080,
 		Routes: []config.Route{
 			{
-				Path:    "/api/upload",
-				Retries: 1,
+				Path:         "/api/upload",
+				Retries:      1,
+				RetryMethods: []string{http.MethodPost},
 				Backends: []config.Backend{
 					{URL: backend1.URL},
 					{URL: backend2.URL},
@@ -849,6 +850,7 @@ func TestProxyRetryWithRequestBody(t *testing.T) {
 
 	payload := `{"username":"alice","action":"create"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/upload", strings.NewReader(payload))
+	req.Header.Set("Idempotency-Key", "create-alice")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
