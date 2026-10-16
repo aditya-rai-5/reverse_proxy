@@ -85,12 +85,34 @@ type Route struct {
 	Rewrite        *RewriteRule          `yaml:"rewrite"`
 	Algorithm      string                `yaml:"algorithm,omitempty"`
 	CookieName     string                `yaml:"cookie_name,omitempty"`
-	Retries        int                   `yaml:"retries,omitempty"`
+	Retries        int                   `yaml:"retries"`
 	RetryMethods   []string              `yaml:"retry_methods"`
 	Timeout        time.Duration         `yaml:"timeout,omitempty"`
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuit_breaker,omitempty"`
 	RateLimit      *RateLimit            `yaml:"rate_limit,omitempty"`
 	Backends       []Backend             `yaml:"backends"`
+}
+
+// UnmarshalYAML resolves the retry default at the YAML boundary, where an
+// omitted setting can still be distinguished from an explicit zero. Keep
+// Retries as an int so programmatic configs and routing use a resolved budget.
+func (r *Route) UnmarshalYAML(node *yaml.Node) error {
+	type plainRoute Route
+	var decoded plainRoute
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	var settings struct {
+		Retries *int `yaml:"retries"`
+	}
+	if err := node.Decode(&settings); err != nil {
+		return err
+	}
+	if settings.Retries == nil && len(decoded.Backends) > 1 {
+		decoded.Retries = min(len(decoded.Backends)-1, 2)
+	}
+	*r = Route(decoded)
+	return nil
 }
 
 // NormalizeRetryMethods supplies a conservative default when omitted. An
@@ -303,13 +325,6 @@ func validate(cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("route[%d]: %w", i, err)
 		}
-		if route.Retries == 0 && len(route.Backends) > 1 {
-			route.Retries = len(route.Backends) - 1
-			if route.Retries > 2 {
-				route.Retries = 2
-			}
-		}
-
 		if route.Timeout < 0 {
 			return fmt.Errorf("route[%d]: timeout must be non-negative", i)
 		}

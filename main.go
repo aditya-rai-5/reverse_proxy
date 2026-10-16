@@ -224,7 +224,7 @@ type rateLimitStatus struct {
 type routeStatus struct {
 	Path         string           `json:"path"`
 	Algorithm    string           `json:"algorithm,omitempty"`
-	Retries      int              `json:"retries,omitempty"`
+	Retries      int              `json:"retries"`
 	RetryMethods []string         `json:"retry_methods"`
 	RateLimit    *rateLimitStatus `json:"rate_limit,omitempty"`
 	Backends     []backendStatus  `json:"backends"`

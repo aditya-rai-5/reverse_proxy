@@ -116,3 +116,83 @@ func TestHealthzReportsEffectiveRetryMethods(t *testing.T) {
 		}
 	}
 }
+
+func TestConfiguredRetryBudgetWithHandlerHealthAndMetrics(t *testing.T) {
+	for _, tt := range []struct {
+		name, setting string
+		wantBudget    int
+		wantStatus    int
+		wantSecond    int64
+	}{
+		{"explicit zero", "retries: 0", 0, http.StatusBadGateway, 0},
+		{"omitted", "", 1, http.StatusOK, 1},
+		{"explicit positive", "retries: 1", 1, http.StatusOK, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var firstCalls, secondCalls atomic.Int64
+			first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				firstCalls.Add(1)
+				http.Error(w, "upstream failed", http.StatusBadGateway)
+			}))
+			defer first.Close()
+			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				secondCalls.Add(1)
+				_, _ = io.WriteString(w, "recovered")
+			}))
+			defer second.Close()
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			data := fmt.Sprintf(`port: 8080
+routes:
+  - path: /api
+    %s
+    backends:
+      - url: %s
+      - url: %s
+`, tt.setting, first.URL, second.URL)
+			if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := router.New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := metrics.New(r)
+			h := http.NewServeMux()
+			h.Handle("/", buildHandler(cfg, r, m))
+			h.Handle("/metrics", m.Handler())
+			h.HandleFunc("/healthz", makeHealthzHandler(r, cfg))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api", nil))
+			if rec.Code != tt.wantStatus || firstCalls.Load() != 1 || secondCalls.Load() != tt.wantSecond {
+				t.Fatalf("status=%d first=%d second=%d; want %d, 1, %d", rec.Code, firstCalls.Load(), secondCalls.Load(), tt.wantStatus, tt.wantSecond)
+			}
+			health := httptest.NewRecorder()
+			h.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			var state struct {
+				Routes []struct {
+					Retries *int `json:"retries"`
+				} `json:"routes"`
+			}
+			if err := json.Unmarshal(health.Body.Bytes(), &state); err != nil {
+				t.Fatal(err)
+			}
+			if len(state.Routes) != 1 || state.Routes[0].Retries == nil || *state.Routes[0].Retries != tt.wantBudget {
+				t.Fatalf("healthz must report explicit retry budget %d: %s", tt.wantBudget, health.Body.String())
+			}
+			scrape := httptest.NewRecorder()
+			h.ServeHTTP(scrape, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+			backend := first.URL
+			if tt.wantSecond > 0 {
+				backend = second.URL
+			}
+			wantMetric := fmt.Sprintf(`http_requests_total{route="/api",backend="%s",status_code="%d"} 1`, backend, tt.wantStatus)
+			if !strings.Contains(scrape.Body.String(), wantMetric) {
+				t.Errorf("missing %s in metrics:\n%s", wantMetric, scrape.Body.String())
+			}
+		})
+	}
+}
