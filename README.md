@@ -15,6 +15,7 @@ Start with the Docker demo for a working stack with mock backends and monitoring
 - [Health and monitoring](#health-and-monitoring)
 - [Troubleshooting](#troubleshooting)
 - [Development and contributions](#development-and-contributions)
+- [Dependency bots](#dependency-bots)
 
 ## Features
 
@@ -283,3 +284,19 @@ For coverage:
 ```bash
 go test -cover ./...
 ```
+
+## Dependency bots
+
+Two bots share dependency maintenance without opening duplicate updates:
+
+- **Dependabot** checks Go modules and GitHub Actions every Monday at 09:00 Asia/Kolkata. Its configuration is in [.github/dependabot.yml](.github/dependabot.yml). Minor and patch Go updates are grouped; major Go updates remain separate.
+- **Renovate** checks Dockerfile base images and Docker Compose images. Its configuration is in [.github/renovate.json](.github/renovate.json). The locally built `reverse-proxy-demo` image is excluded. Renovate creates and maintains a **Dependency Dashboard** issue; approve major container upgrades there before it opens their pull requests.
+
+To activate the bots:
+
+1. Merge these configuration files into the repository's default branch, `main`. Dependabot version updates start from the checked-in configuration; inspect **Insights → Dependency graph → Dependabot** for update jobs.
+2. [Install the Renovate GitHub App](https://github.com/apps/renovate), choose **Only select repositories**, and select `aditya-rai-5/reverse_proxy`. If an onboarding PR appears, review and merge it, preserving the manager split above.
+3. In **Settings → Advanced Security** (called **Code security and analysis** in some GitHub interfaces), enable **Dependency graph**, **Dependabot alerts**, and **Dependabot security updates** if available. Security alerts and security update PRs are separate from weekly version updates.
+4. Check the **Actions** tab for the [CI workflow](.github/workflows/ci.yml). It builds and vets Go code, runs the race tests, validates Compose, and builds the proxy Docker image. Review passing bot PRs before merging; automerge is disabled. Image builds do not verify the running demo stack.
+
+The dashboard tracks dependency work; these bots do not discover arbitrary application bugs or propose new product features. Update PRs appear when eligible updates exist, so immediate PR activity is not guaranteed. Opening an issue or installing a bot does not itself create a code contribution. Contributor displays are controlled by GitHub; do not rely on installation alone to add a bot to the Contributors list.
