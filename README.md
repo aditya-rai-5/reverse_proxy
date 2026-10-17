@@ -1,184 +1,250 @@
 # Reverse Proxy in Go
 
-A fast, production-style HTTP reverse proxy with path-based routing, path stripping & rewriting, round-robin load balancing, active background health checks, graceful shutdown, and a `/healthz` observability endpoint.
+An HTTP reverse proxy written in Go, with path-based routing, five load balancing algorithms, backend health checks, safe retries, circuit breakers, rate limiting, HTTPS termination, and Prometheus metrics.
+
+Start with the Docker demo for a working stack with mock backends and monitoring, or run the proxy locally against your own upstream services.
+
+## Contents
+
+- [Features](#features)
+- [Quick start: Docker demo](#quick-start-docker-demo)
+- [Run locally](#run-locally)
+- [Configuration](#configuration)
+- [Retry safety](#retry-safety)
+- [HTTPS](#https)
+- [Health and monitoring](#health-and-monitoring)
+- [Troubleshooting](#troubleshooting)
+- [Development and contributions](#development-and-contributions)
 
 ## Features
 
-- **Path-Based Routing:** Longest-prefix matching route resolution with boundary protection (e.g. `/api` won't mistakenly match `/apikeys`).
-- **Path Stripping & Rewriting:** Strip prefixes (`strip_prefix: "/api"`) or rewrite paths via regex (`rewrite: { pattern: "^/legacy/(.*)$", replacement: "/v2/$1" }`) before forwarding upstream.
-- **Advanced Load Balancing Algorithms:**
-  - **Round-Robin (`round_robin`):** Lock-free, atomic round-robin request distribution.
-  - **Weighted Round-Robin (`weighted_round_robin`):** Smooth Weighted Round-Robin (Nginx algorithm) distributing traffic according to server weights (e.g., `weight: 2`).
-  - **Least Connections (`least_conn`):** Real-time tracking of active in-flight requests per backend, routing each request to the least busy healthy server.
-  - **IP Hash (`ip_hash`):** Deterministic hashing of client IP (from `RemoteAddr` or `X-Forwarded-For`), pinning clients to backends with automatic failover.
-  - **Sticky Sessions (`sticky`):** Cookie-based session persistence (configurable `cookie_name`) ensuring subsequent user requests stay on the same backend, with automatic health failover.
-- **Rate Limiting Middleware:** Protects backends from abuse using the token bucket algorithm (`golang.org/x/time/rate`). Enforces per-IP limits configured in YAML (globally or per-route via `requests_per_minute` and `burst`). Returns HTTP `429 Too Many Requests` with a `Retry-After` header when exceeded, with automatic background TTL cleanup of inactive client IP entries.
-- **Safe Request Retries:** By default only `GET`, `HEAD`, and `OPTIONS` retry after an upstream `502`, `504`, connection error, or per-attempt timeout. Write retries require route opt-in and an `Idempotency-Key` enforced by the backends. Client cancellation stops retries without counting as a backend failure.
-- **Bounded Retry Buffering:** Request bodies up to `max_request_body_bytes` (10 MiB by default) are retained for retries. Larger bodies are streamed to one backend without retries.
-- **Circuit Breaking:** Tracks consecutive failures per backend. If a backend fails 5 consecutive times (configurable `failure_threshold`), the circuit breaker trips **Open**, immediately skipping the backend for subsequent client requests so clients are not slowed down. Automatically transitions to **Half-Open** after a cooldown period (`cooldown`) to test backend recovery.
-- **Active Health Checks:** Periodic background HTTP probing of all upstream backends with automatic failure detection and recovery.
-- **Failover & Fault Tolerance:** Dead backends are automatically skipped across all load balancing algorithms; returns HTTP `503 Service Unavailable` if all backends are down.
-- **Header Forwarding:** Automatically preserves and forwards `X-Forwarded-For` and `X-Forwarded-Host`.
-- **Healthz Endpoint:** Exposes `GET /healthz` returning JSON status of all backends (including health status, weight, active in-flight connections, circuit breaker state, consecutive failures, and route algorithm).
-- **Prometheus Metrics:** Exposes `GET /metrics` with request totals by route/backend/status, request latency histograms, and backend health gauges.
-- **Graceful Shutdown:** Catches `SIGINT`/`SIGTERM` and drains in-flight requests with a 10-second timeout.
-- **HTTPS Termination:** Serve HTTPS using a configured certificate/key pair or automatically provision and renew Let's Encrypt certificates with `autocert`. TLS mode redirects ordinary HTTP traffic to HTTPS and leaves ACME HTTP-01 challenge paths available.
+- Longest-prefix routing with path boundaries: `/api` matches `/api/users`, but not `/apikeys`.
+- Prefix stripping and regular expression path rewriting.
+- Round-robin, weighted round-robin, least connections, IP hash, and cookie-based sticky sessions.
+- Background health checks, automatic backend failover, and per-backend circuit breakers.
+- Global and per-route token bucket rate limits with HTTP `429` and `Retry-After` responses.
+- Configurable retries with bounded request body buffering and explicit write-method safeguards.
+- HTTPS using certificate files or automatic Let's Encrypt certificates.
+- JSON backend status at `/healthz` and Prometheus metrics at `/metrics`.
+- Graceful shutdown on `SIGINT` or `SIGTERM`, with up to 10 seconds to drain requests.
+
+## Quick start: Docker demo
+
+Requires Docker with the Compose plugin. Run these commands from the repository root:
+
+```bash
+git clone https://github.com/aditya-rai-5/reverse_proxy.git
+cd reverse_proxy
+docker compose up --build
+```
+
+The stack starts the proxy, three mock backends, Prometheus, Grafana, and a traffic generator. It uses [demo/config.yaml](demo/config.yaml), mounted as the container's `/app/config.yaml`.
+
+Once the services start:
+
+```bash
+curl -i http://localhost:8080/api/demo
+curl -i http://localhost:8080/limited/demo
+curl -i http://localhost:8080/breaker/demo
+curl -i http://localhost:8080/healthz
+curl http://localhost:8080/metrics
+```
+
+- Proxy: [localhost:8080/api/demo](http://localhost:8080/api/demo).
+- Prometheus: [localhost:9090](http://localhost:9090).
+- Grafana: [localhost:3000](http://localhost:3000), using **admin / demo**. Open **Reverse Proxy → Reverse Proxy Demo**.
+
+The traffic generator continuously exercises `/api`, `/limited`, and `/breaker`. The `/limited` route deliberately produces rate-limit rejections. Backend3 returns `502` for normal requests while its `/health` endpoint stays healthy, so `/breaker` demonstrates circuit-breaker trips. During an open circuit, `/healthz` can report `503` even though backend3 is reachable.
+
+Stop the stack with `Ctrl+C`, then remove the containers and network:
+
+```bash
+docker compose down
+```
+
+Prometheus and Grafana data remain in named volumes. To also delete that demo data:
+
+```bash
+docker compose down -v
+```
+
+The bundled Grafana credentials are for the local demo only.
+
+## Run locally
+
+Requires Git and **Go 1.27.1**, as declared in [go.mod](go.mod). Docker is optional for this workflow.
+
+```bash
+git clone https://github.com/aditya-rai-5/reverse_proxy.git
+cd reverse_proxy
+go mod download
+```
+
+1. Start your upstream HTTP services. Each backend should serve the configured health-check path with a `2xx` response.
+2. Edit [config.yaml](config.yaml) to point to those services. The checked-in example references local ports `9000`–`9008`; `go run` does not start those backends.
+3. Run the proxy from the repository root:
+
+   ```bash
+   go run .
+   ```
+
+4. In another terminal, send a request and inspect backend status:
+
+   ```bash
+   curl -i http://localhost:8080/api/users
+   curl -i http://localhost:8080/healthz
+   ```
+
+To build and run a binary instead:
+
+```bash
+go build .
+./reverse_proxy
+```
+
+The application always reads `config.yaml` from its **current working directory**. There is no command-line config-path flag. Restart the process after changing configuration. Press `Ctrl+C` to shut down.
 
 ## Configuration
 
-Configure routes and features via `config.yaml`:
+The following is a complete, smaller alternative to the checked-in configuration. Replace the backend URLs with your services:
 
 ```yaml
 port: 8080
-max_request_body_bytes: 10485760 # 10 MiB retained for retries; larger bodies stream once
+max_request_body_bytes: 10485760 # 10 MiB retry buffer per eligible request
 
-# Global per-IP rate limiting (token bucket via golang.org/x/time/rate)
+health_check:
+  path: /health
+  interval: 10s
+  timeout: 5s
+
 rate_limit:
   requests_per_minute: 60
   burst: 10
 
-health_check:
-  path: "/health"
-  interval: 10s
-  timeout: 5s
-
 routes:
-  # Weighted Round-Robin with Retries & Circuit Breaker
-  - path: "/api"
-    strip_prefix: "/api"
-    algorithm: "weighted_round_robin"
-    retries: 2             # Retry eligible requests on other healthy backends
-    retry_methods: [GET, HEAD, OPTIONS] # Defaults; writes require explicit opt-in
-    timeout: 3s            # Per-attempt request timeout
+  - path: /api
+    strip_prefix: /api
+    algorithm: weighted_round_robin
+    retries: 1
+    retry_methods: [GET, HEAD, OPTIONS]
+    timeout: 3s
     circuit_breaker:
-      failure_threshold: 5 # Trip breaker Open after 5 consecutive failures
-      cooldown: 10s        # Cooldown duration before attempting recovery
+      failure_threshold: 5
+      cooldown: 10s
     backends:
-      - url: "http://localhost:9001"
+      - url: http://localhost:9001
         weight: 2
-      - url: "http://localhost:9002"
+      - url: http://localhost:9002
         weight: 1
-
-  # Least Connections: routes to backend with least in-flight requests (with route-level rate limit)
-  - path: "/compute"
-    algorithm: "least_conn"
-    retries: 1
-    timeout: 5s
-    rate_limit:
-      requests_per_minute: 30
-      burst: 5
-    backends:
-      - url: "http://localhost:9003"
-      - url: "http://localhost:9004"
-
-  # Sticky Sessions: uses session cookie to keep subsequent requests on the same backend
-  - path: "/app"
-    algorithm: "sticky"
-    cookie_name: "SERVERID"
-    retries: 1
-    backends:
-      - url: "http://localhost:9005"
-      - url: "http://localhost:9006"
-
-  # IP Hash: hashes client IP to deterministically pin user requests
-  - path: "/ip"
-    algorithm: "ip_hash"
-    retries: 1
-    backends:
-      - url: "http://localhost:9007"
-      - url: "http://localhost:9008"
-
-  # Fallback root route (defaults to round-robin)
-  - path: "/"
-    algorithm: "round_robin"
-    backends:
-      - url: "http://localhost:9000"
 ```
 
-### Retry safety
+With this configuration, `/api/users` reaches an upstream as `/users`. An unrelated path has no matching route. Add a route with `path: /` if you want a catch-all.
 
-`retries` sets the retry budget. `retry_methods` selects which methods may use
-that budget and defaults to `[GET, HEAD, OPTIONS]`. An explicit empty list
-(`retry_methods: []`) disables proxy retries for the route. A configured list
-replaces the default rather than extending it. Existing configurations keep
-read-method failover; POST, PATCH, PUT, and DELETE are forwarded once by default.
+### Routing and load balancing
 
-To retry a write method, include it explicitly:
+Routes are evaluated by longest matching path, independently of their order in YAML. Prefix stripping runs before regex rewriting. For example, this optional route field rewrites `/legacy/users` to `/v2/users`:
+
+```yaml
+rewrite:
+  pattern: '^/legacy/(.*)$'
+  replacement: '/v2/$1'
+```
+
+Choose a route's `algorithm`:
+
+- `round_robin`: rotates across healthy backends; the default when no custom weights are supplied.
+- `weighted_round_robin`: distributes requests using smooth weighted round-robin. A backend's omitted or zero `weight` becomes `1`. If `algorithm` is omitted and any weight exceeds `1`, weighted round-robin is selected automatically.
+- `least_conn`: selects the healthy backend with the fewest active requests.
+- `ip_hash`: selects a backend using the client IP.
+- `sticky`: keeps a client on a backend using a cookie. Set `cookie_name` to customize its name; the default is `SERVERID`.
+
+Unhealthy backends and open circuits are skipped during selection.
+
+### Defaults and limits
+
+- `port` is required, including when TLS is configured. Without TLS, it is the HTTP listener port.
+- `max_request_body_bytes` defaults to `10485760` (10 MiB) when omitted or zero. It limits retry buffering, **not upload size**: larger bodies stream to one backend without retries.
+- `health_check` defaults to `/health`, a `10s` interval, and a `5s` timeout. Probes use the backend's scheme and host plus this path, without route rewriting. Non-`2xx` responses and connection failures mark a backend unhealthy.
+- `timeout` is a per-attempt upstream timeout, such as `3s`. Omitted or zero adds no route-specific deadline.
+- `circuit_breaker` defaults to a failure threshold of `5` and a `10s` cooldown, even when the section is omitted. After cooldown, a half-open circuit allows a recovery attempt.
+- `rate_limit.requests_per_minute` enables per-IP limiting when positive. Omitted or zero disables that limiter. For an enabled limiter, omitted or zero `burst` defaults to `1`.
+
+A route may also define its own `rate_limit` section. Global and route limits both apply; a route limit does not replace the global limit. `/healthz` and `/metrics` bypass these proxy request limiters.
+
+## Retry safety
+
+`retries` sets the number of **additional attempts** after the initial request:
+
+- Omitted or `null`: defaults to `min(number of backends - 1, 2)`.
+- `retries: 0`: disables retries, including on routes with multiple backends.
+- A positive value: sets an explicit retry budget. Actual attempts also depend on eligible, available backends.
+
+The effective budget, including zero, is reported by `/healthz`. Retries can follow upstream `502` or `504` responses, connection errors, or per-attempt timeouts. They are not triggered by every `5xx` response.
+
+`retry_methods` defaults to `[GET, HEAD, OPTIONS]`. A configured list replaces that default; `retry_methods: []` disables retries. Supported methods are `GET`, `HEAD`, `OPTIONS`, `POST`, `PATCH`, `PUT`, and `DELETE`.
+
+To opt a write method into retries, configure it explicitly:
 
 ```yaml
 routes:
-  - path: "/payments"
+  - path: /payments
     retries: 1
     retry_methods: [GET, HEAD, OPTIONS, POST]
     backends:
-      - url: "http://payments-1:9001"
-      - url: "http://payments-2:9002"
+      - url: http://payments-1:9001
+      - url: http://payments-2:9002
 ```
 
-POST, PATCH, PUT, and DELETE also require exactly one non-empty
-`Idempotency-Key` request header. Without it, even an opted-in write is forwarded
-once. The same key and buffered body are forwarded on each attempt. A key alone
-does not enable retries on a route that has not opted in. Unknown retry methods
-are rejected during configuration loading/router construction.
+`POST`, `PATCH`, `PUT`, and `DELETE` additionally require exactly one non-empty `Idempotency-Key` request header. The same key and buffered body are forwarded on each attempt. A key alone does not enable retries, and oversized bodies still stream once.
 
-Only enable write retries when **all backends share durable, atomic
-deduplication for the key**, bind it to the operation/payload, and retain the
-result long enough for retries. The proxy checks eligibility and preserves the
-key; it does not store keys or deduplicate application writes. Larger bodies
-still stream once without retries, regardless of method/key eligibility.
+Enable write retries only when **all backends share durable, atomic deduplication** for the key, bind it to the operation and payload, and retain the result long enough for retries. The proxy does not store keys or deduplicate writes.
 
-Cancellation is checked before forwarding and after each attempt. It stops
-retries and leaves backend failure counters unchanged. Observations use `499`
-for client cancellation and `504` for an expired client request deadline;
-disconnected clients may not receive those responses. A route's per-attempt
-timeout can still count as an upstream failure and retry while the original
-request context remains active. Once response headers have been sent, no error
-body is appended on cancellation.
+Client cancellation stops retries without increasing backend failure counters. Observations use `499` for cancellation and `504` for an expired client deadline; a disconnected client may not receive a response. A route's per-attempt timeout can still count as an upstream failure while the client request remains active.
 
-### HTTPS with certificate files
+## HTTPS
 
-Add a `tls` section to terminate TLS in the proxy. HTTPS listens on port `443` and HTTP redirects from port `80` by default; both ports can be changed for local development or deployments behind a port mapper.
+Add one of the following top-level `tls` sections to your configuration, keeping `port` and `routes`.
+
+### Certificate files
 
 ```yaml
 tls:
-  cert_file: "/etc/reverse-proxy/tls/fullchain.pem"
-  key_file: "/etc/reverse-proxy/tls/privkey.pem"
+  cert_file: /etc/reverse-proxy/tls/fullchain.pem
+  key_file: /etc/reverse-proxy/tls/privkey.pem
   https_port: 443
   http_port: 80
 ```
 
-### Let's Encrypt automatic certificates
+Both files must be readable by the proxy process. For local development, use unprivileged ports such as `8443` and `8080` if needed.
 
-Set `auto_cert: true`, list the exact domain names this proxy serves, and keep the cache directory on persistent storage. DNS for each domain must point to this host, and the configured HTTP/HTTPS ports must be reachable by Let's Encrypt (normally ports 80 and 443).
+### Automatic Let's Encrypt certificates
 
 ```yaml
 tls:
   auto_cert: true
   domains:
-    - "proxy.example.com"
-  email: "admin@example.com"
-  cache_dir: "/var/lib/reverse-proxy/autocert"
+    - proxy.example.com
+  email: admin@example.com
+  cache_dir: /var/lib/reverse-proxy/autocert
   https_port: 443
   http_port: 80
 ```
 
-Use either `cert_file` plus `key_file` or `auto_cert`, not both. Without a `tls` section, the existing plain HTTP listener on `port` is used.
+Use exact hostnames without schemes, ports, or wildcards. DNS must point to the proxy, and public ports `80` and `443` must reach its HTTP and HTTPS listeners. Persist the certificate cache in a directory writable by the proxy. Enabling automatic certificates accepts the ACME provider's terms through `autocert`.
 
-## Running Tests
+Choose certificate files or `auto_cert`, not both. HTTPS defaults to port `443`, and HTTP defaults to port `80`. Ordinary HTTP requests redirect to HTTPS; automatic certificate mode also serves ACME HTTP-01 challenges. Without `tls`, the proxy serves plain HTTP on `port`.
 
-Run all unit and integration tests across all packages:
+Keep private keys and certificate caches out of commits. The bundled Docker demo uses plain HTTP; a TLS deployment needs its own port mappings and certificate/cache mounts.
 
-```bash
-go test -v ./...
-```
+## Health and monitoring
 
-Run tests with test coverage:
+`GET /healthz` returns JSON with overall status, route algorithms, retry budgets, retry methods, rate limits, and backend details. Those details include health and circuit state, with weights, active connections, and failure counters where applicable.
 
-```bash
-go test -cover ./...
-```
+It returns `200` when all backends are healthy and no circuit is open, or `503` with status `degraded` otherwise. A degraded result does not necessarily mean every route is unavailable.
 
-Prometheus can scrape the proxy with:
+`GET /metrics` exposes Prometheus text metrics for requests, latency, backend health, rate-limit rejections, and circuit breakers. The demo includes [Prometheus configuration](prometheus/prometheus.yml) and a provisioned [Grafana dashboard](grafana/dashboards/reverse-proxy.json).
+
+For a Prometheus instance running directly on the same host:
 
 ```yaml
 scrape_configs:
@@ -187,57 +253,33 @@ scrape_configs:
       - targets: ["localhost:8080"]
 ```
 
-When TLS is enabled, configure the scrape target to use the HTTPS listener.
+Inside a container, `localhost` refers to that container. The Compose setup uses `proxy:8080`. When TLS is enabled, scrape the HTTPS listener with `scheme: https` and the appropriate certificate trust settings.
 
-## Running the Proxy
+## Troubleshooting
 
-1. Start the proxy server:
-```bash
-go run main.go
-```
+- **Cannot read `config.yaml`:** run from the repository root, or place the configuration in the binary's working directory.
+- **Port already in use:** stop the conflicting process, change `port` locally, or change the published host port in Compose. Local and Docker workflows both use `8080` by default.
+- **`502` response:** check that the URL matches a route and that upstream URLs are reachable. Inspect proxy logs for forwarding errors.
+- **`503` response:** inspect `/healthz` for unhealthy backends or open circuits. Verify upstream `/health` responses and the configured probe path.
+- **`429` response:** check global and route rate limits; the demo's `/limited` route intentionally rejects excess traffic.
+- **Empty dashboard:** check `docker compose ps` and `docker compose logs proxy prometheus traffic-generator`, then allow time for scrapes and traffic to accumulate.
+- **Go build fails:** check `go version` against [go.mod](go.mod) and ensure dependencies can be downloaded. The Docker build pins the same Go version.
 
-2. Inspect the health of all upstream backends:
-```bash
-curl http://localhost:8080/healthz
-```
+## Development and contributions
 
-## One-Click Docker Demo
+See [contribution.md](contribution.md) for setup, project structure, coding conventions, regression testing, and pull request guidance.
 
-The Compose demo builds the proxy, starts three mock backends, Prometheus, and
-Grafana, and runs a small traffic generator so the dashboard has live data as
-soon as the stack is healthy. It uses the separate [`demo/config.yaml`](demo/config.yaml)
-and does not change the normal `config.yaml` setup.
+Run the core checks from the repository root:
 
 ```bash
-docker compose up --build
+go build .
+go test -v ./...
+go test -race ./...
+go vet ./...
 ```
 
-Open [Grafana](http://localhost:3000) and choose **Reverse Proxy Demo** in the
-**Reverse Proxy** folder. Sign in with `admin` / `demo`. The preloaded dashboard
-shows request rate, p50/p95/p99 latency, rate-limit rejections, circuit-breaker
-trips and state, and backend health. Prometheus is also available at
-[localhost:9090](http://localhost:9090), and the proxy is at
-[localhost:8080](http://localhost:8080).
-
-Try the routes directly:
+For coverage:
 
 ```bash
-curl http://localhost:8080/api/demo
-curl http://localhost:8080/limited/demo
-curl http://localhost:8080/healthz
+go test -cover ./...
 ```
-
-The generator continuously calls `/api`, `/limited`, and `/breaker`, which fills
-the request and rate-limit panels and repeatedly trips the breaker. Backend3 is
-configured to return HTTP 502 for normal requests while `/health` remains OK,
-so it acts as a controlled failure source without marking the backend unhealthy.
-You can also exercise the failure route directly:
-
-```bash
-curl -i http://localhost:8080/breaker/demo
-```
-
-The breaker panel records the trip while the backend health panel shows backend3
-as reachable. Stop the demo with `Ctrl+C`, or run `docker compose down` in another
-terminal. Add `-v` to `down` if you also want to remove the Prometheus and
-Grafana data volumes.
