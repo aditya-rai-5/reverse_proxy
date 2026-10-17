@@ -267,7 +267,7 @@ Inside a container, `localhost` refers to that container. The Compose setup uses
 
 ## Development and contributions
 
-See [contribution.md](contribution.md) for setup, project structure, coding conventions, regression testing, and pull request guidance.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, project structure, coding conventions, regression testing, and pull request guidance.
 
 Run the core checks from the repository root:
 
