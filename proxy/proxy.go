@@ -312,7 +312,13 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	removeHopByHopHeaders(outReq.Header)
 
 	outReq.Header.Set("X-Forwarded-Host", r.Host)
-	outReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	// Replace client-supplied identity headers with the resolved address.
+	outReq.Header.Del("Forwarded")
+	outReq.Header.Del("X-Real-IP")
+	outReq.Header.Del("X-Forwarded-For")
+	if ip := h.router.ClientIPResolver().Resolve(r); ip != "" {
+		outReq.Header.Set("X-Forwarded-For", ip)
+	}
 
 	log.Printf("[PROXY] %s %s → %s%s", outReq.Method, r.URL.Path, target.Host, outReq.URL.Path)
 
