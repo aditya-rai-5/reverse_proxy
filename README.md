@@ -172,6 +172,44 @@ Unhealthy backends and open circuits are skipped during selection.
 
 A route may also define its own `rate_limit` section. Global and route limits both apply; a route limit does not replace the global limit. `/healthz` and `/metrics` bypass these proxy request limiters.
 
+### Client IP and trusted proxies
+
+By default, rate limiting and IP hash balancing identify clients by the immediate
+connection peer (`RemoteAddr`). Client-supplied `X-Forwarded-For`, `X-Real-IP`, and
+`Forwarded` headers cannot override that identity.
+
+When running behind an ingress proxy you control, configure its actual source
+addresses as CIDRs at the top level:
+
+```yaml
+trusted_proxies:
+  - "10.20.0.5/32" # Replace with your ingress proxy's source address.
+  - "2001:db8:1::5/128" # Example IPv6 address; replace before use.
+```
+
+An omitted or empty list trusts no proxies. Invalid CIDRs fail startup. Do not
+trust entire private networks or all addresses unless every sender in that range
+is a trusted proxy. The bundled configurations use `trusted_proxies: []`.
+
+Only a trusted immediate peer may supply `X-Forwarded-For`. The proxy reads all
+header lines in order, walks the chain from right to left, skips trusted proxy
+addresses, and uses the first untrusted address. Your ingress must overwrite
+incoming forwarding headers or append the actual connecting client's address.
+For example, from a trusted peer, `1.2.3.4, 198.51.100.25` resolves to
+`198.51.100.25`; the leftmost value may have been supplied by the client.
+
+Missing, malformed, or entirely trusted chains fall back to the immediate peer.
+Header addresses must be IP literals without ports or IPv6 zones. IPv4-mapped
+IPv6 addresses are normalized to IPv4. `X-Real-IP` and `Forwarded` are never used
+for client identity. Deployments previously relying on those headers must configure
+their ingress to supply `X-Forwarded-For` instead. Without configured trust,
+clients behind an ingress share its rate-limit bucket and IP hash identity.
+
+The upstream receives one sanitized `X-Forwarded-For` address without a port,
+rather than the original chain. Incoming `X-Real-IP` and `Forwarded` are removed.
+If the peer address cannot be parsed, requests share an empty identity and no
+client-IP header is forwarded.
+
 ## Retry safety
 
 `retries` sets the number of **additional attempts** after the initial request:

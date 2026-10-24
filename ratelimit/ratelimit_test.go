@@ -112,75 +112,17 @@ func TestRateLimiterMiddleware(t *testing.T) {
 }
 
 func TestExtractClientIP(t *testing.T) {
-	tests := []struct {
-		name       string
-		remoteAddr string
-		xff        string
-		xri        string
-		expected   string
-	}{
-		{
-			name:       "RemoteAddr with port",
-			remoteAddr: "192.168.1.1:12345",
-			expected:   "192.168.1.1",
-		},
-		{
-			name:       "RemoteAddr IPv6 with port",
-			remoteAddr: "[::1]:54321",
-			expected:   "::1",
-		},
-		{
-			name:       "RemoteAddr plain IP without port",
-			remoteAddr: "10.0.0.1",
-			expected:   "10.0.0.1",
-		},
-		{
-			name:       "X-Forwarded-For single IP",
-			remoteAddr: "127.0.0.1:8000",
-			xff:        "203.0.113.195",
-			expected:   "203.0.113.195",
-		},
-		{
-			name:       "X-Forwarded-For multiple IPs (take first)",
-			remoteAddr: "127.0.0.1:8000",
-			xff:        "203.0.113.195, 70.41.3.18, 150.172.238.178",
-			expected:   "203.0.113.195",
-		},
-		{
-			name:       "X-Real-IP takes precedence over RemoteAddr",
-			remoteAddr: "127.0.0.1:8000",
-			xri:        "198.51.100.4",
-			expected:   "198.51.100.4",
-		},
-		{
-			name:       "X-Forwarded-For takes precedence over X-Real-IP",
-			remoteAddr: "127.0.0.1:8000",
-			xff:        "203.0.113.10",
-			xri:        "198.51.100.4",
-			expected:   "203.0.113.10",
-		},
+	for _, peer := range []string{"192.0.2.1:1234", "192.0.2.1:5678"} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = peer
+		req.Header.Set("X-Forwarded-For", "203.0.113.1")
+		req.Header.Set("X-Real-IP", "203.0.113.2")
+		if got := ExtractClientIP(req); got != "192.0.2.1" {
+			t.Fatalf("ExtractClientIP() = %q", got)
+		}
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			req.RemoteAddr = tt.remoteAddr
-			if tt.xff != "" {
-				req.Header.Set("X-Forwarded-For", tt.xff)
-			}
-			if tt.xri != "" {
-				req.Header.Set("X-Real-IP", tt.xri)
-			}
-
-			ip := ExtractClientIP(req)
-			if ip != tt.expected {
-				t.Errorf("ExtractClientIP() = %q, expected %q", ip, tt.expected)
-			}
-		})
-	}
-
-	if ip := ExtractClientIP(nil); ip != "127.0.0.1" {
-		t.Errorf("ExtractClientIP(nil) = %q, expected '127.0.0.1'", ip)
+	if got := ExtractClientIP(nil); got != "" {
+		t.Fatalf("nil request = %q", got)
 	}
 }
 

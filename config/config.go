@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aditya-rai-5/reverse_proxy/clientip"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -185,6 +187,7 @@ func (hc *HealthCheck) defaults() {
 }
 
 type Config struct {
+	TrustedProxies      []string    `yaml:"trusted_proxies"`
 	Port                int         `yaml:"port"`
 	MaxRequestBodyBytes int64       `yaml:"max_request_body_bytes"`
 	TLS                 *TLS        `yaml:"tls,omitempty"`
@@ -217,6 +220,9 @@ func Load(path string) (*Config, error) {
 }
 
 func validate(cfg *Config) error {
+	if _, err := clientip.NewResolver(cfg.TrustedProxies); err != nil {
+		return err
+	}
 	if cfg.Port == 0 {
 		return fmt.Errorf("port must be specified")
 	}

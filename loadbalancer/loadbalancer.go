@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/aditya-rai-5/reverse_proxy/circuitbreaker"
+	"github.com/aditya-rai-5/reverse_proxy/clientip"
 	"github.com/aditya-rai-5/reverse_proxy/config"
-	"github.com/aditya-rai-5/reverse_proxy/ratelimit"
 )
 
 // ErrNoHealthyBackend is returned when every backend is unhealthy or unavailable.
@@ -75,12 +75,13 @@ func WithCircuitBreaker(cfg circuitbreaker.Config) Option {
 // Round-Robin, Weighted Round-Robin, Least Connections, IP Hash, and Sticky Sessions,
 // with integrated Circuit Breaker protection.
 type LoadBalancer struct {
-	backends   []*backend
-	algorithm  string
-	cookieName string
-	cbConfig   circuitbreaker.Config
-	counter    atomic.Uint64
-	mu         sync.Mutex // guards currentWeight calculations in weighted round-robin
+	clientIPResolver *clientip.Resolver
+	backends         []*backend
+	algorithm        string
+	cookieName       string
+	cbConfig         circuitbreaker.Config
+	counter          atomic.Uint64
+	mu               sync.Mutex // guards currentWeight calculations in weighted round-robin
 }
 
 // New creates a LoadBalancer from the given config backends and optional configuration options.
@@ -270,7 +271,7 @@ func (lb *LoadBalancer) nextIPHash(req *http.Request, excluded map[string]bool) 
 		return nil, ErrNoHealthyBackend
 	}
 
-	ip := extractClientIP(req)
+	ip := lb.clientIPResolver.Resolve(req)
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(ip))
 	hashVal := h.Sum32()
@@ -403,6 +404,8 @@ func backendID(u *url.URL) string {
 	return hex.EncodeToString(h[:8])
 }
 
-func extractClientIP(r *http.Request) string {
-	return ratelimit.ExtractClientIP(r)
+// WithClientIPResolver sets the trust policy used by IP hash selection.
+// A nil resolver uses only the immediate peer address.
+func WithClientIPResolver(resolver *clientip.Resolver) Option {
+	return func(lb *LoadBalancer) { lb.clientIPResolver = resolver }
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aditya-rai-5/reverse_proxy/circuitbreaker"
+	"github.com/aditya-rai-5/reverse_proxy/clientip"
 	"github.com/aditya-rai-5/reverse_proxy/config"
 	"github.com/aditya-rai-5/reverse_proxy/loadbalancer"
 	"github.com/aditya-rai-5/reverse_proxy/ratelimit"
@@ -88,10 +89,15 @@ func (e *Entry) RewritePath(requestPath string) string {
 }
 
 type Router struct {
-	routes []Entry
+	clientIPResolver *clientip.Resolver
+	routes           []Entry
 }
 
 func New(cfg *config.Config) (*Router, error) {
+	resolver, err := clientip.NewResolver(cfg.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
 	entries := make([]Entry, 0, len(cfg.Routes))
 
 	for _, route := range cfg.Routes {
@@ -101,6 +107,7 @@ func New(cfg *config.Config) (*Router, error) {
 			return nil, fmt.Errorf("route %q: %w", route.Path, err)
 		}
 		opts := []loadbalancer.Option{
+			loadbalancer.WithClientIPResolver(resolver),
 			loadbalancer.WithAlgorithm(route.Algorithm),
 			loadbalancer.WithCookieName(route.CookieName),
 		}
@@ -119,6 +126,7 @@ func New(cfg *config.Config) (*Router, error) {
 		var rl *ratelimit.Limiter
 		if route.RateLimit != nil && route.RateLimit.Enabled() {
 			rl = ratelimit.New(ratelimit.Config{
+				ClientIPResolver:  resolver,
 				RequestsPerMinute: route.RateLimit.RequestsPerMinute,
 				Burst:             route.RateLimit.Burst,
 			})
@@ -150,7 +158,7 @@ func New(cfg *config.Config) (*Router, error) {
 		return len(entries[i].Path) > len(entries[j].Path)
 	})
 
-	return &Router{routes: entries}, nil
+	return &Router{routes: entries, clientIPResolver: resolver}, nil
 }
 
 func (r *Router) Match(requestPath string) (*Entry, error) {
@@ -177,4 +185,9 @@ func matchesPath(requestPath, routePath string) bool {
 		return true
 	}
 	return requestPath[len(routePath)] == '/'
+}
+
+// ClientIPResolver returns the immutable trust policy shared by request handlers.
+func (r *Router) ClientIPResolver() *clientip.Resolver {
+	return r.clientIPResolver
 }

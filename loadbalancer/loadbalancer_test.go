@@ -2,11 +2,13 @@ package loadbalancer
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 
+	"github.com/aditya-rai-5/reverse_proxy/clientip"
 	"github.com/aditya-rai-5/reverse_proxy/config"
 )
 
@@ -497,37 +499,43 @@ func TestIPHashDeterministic(t *testing.T) {
 }
 
 func TestIPHashXForwardedFor(t *testing.T) {
-	backends := []config.Backend{
-		{URL: "http://server1"},
-		{URL: "http://server2"},
-	}
-
-	lb, err := New(backends, WithAlgorithm(config.AlgorithmIPHash))
+	resolver, err := clientip.NewResolver([]string{"10.0.0.0/24"})
 	if err != nil {
-		t.Fatalf("Failed to create load balancer: %v", err)
+		t.Fatal(err)
 	}
-
-	req1 := httptest.NewRequest(http.MethodGet, "/", nil)
-	req1.Header.Set("X-Forwarded-For", "203.0.113.195, 10.0.0.1")
-	req1.RemoteAddr = "127.0.0.1:4000"
-
-	res1, err := lb.Select(req1)
-	if err != nil {
-		t.Fatalf("Select 1 failed: %v", err)
-	}
-
-	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
-	req2.Header.Set("X-Forwarded-For", "203.0.113.195, 10.0.0.2")
-	req2.RemoteAddr = "127.0.0.1:5000" // different proxy hop
-
-	res2, err := lb.Select(req2)
-	if err != nil {
-		t.Fatalf("Select 2 failed: %v", err)
-	}
-
-	if res1.URL.String() != res2.URL.String() {
-		t.Errorf("Expected identical backend routing via X-Forwarded-For client IP, got %s vs %s",
-			res1.URL.String(), res2.URL.String())
+	backends := []config.Backend{{URL: "http://server1"}, {URL: "http://server2"}, {URL: "http://server3"}}
+	for _, trusted := range []bool{false, true} {
+		opts := []Option{WithAlgorithm(config.AlgorithmIPHash)}
+		if trusted {
+			opts = append(opts, WithClientIPResolver(resolver))
+		}
+		lb, err := New(backends, opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 1; i <= 32; i++ {
+			client := fmt.Sprintf("198.51.100.%d", i)
+			direct := httptest.NewRequest("GET", "/", nil)
+			direct.RemoteAddr = "10.0.0.5:1234"
+			if trusted {
+				direct.RemoteAddr = client + ":1234"
+			}
+			want, err := lb.Select(direct)
+			if err != nil {
+				t.Fatal(err)
+			}
+			forwarded := httptest.NewRequest("GET", "/", nil)
+			forwarded.RemoteAddr = "10.0.0.5:5678"
+			forwarded.Header.Set("X-Forwarded-For", "1.2.3.4, "+client+", 10.0.0.2")
+			forwarded.Header.Set("X-Real-IP", client)
+			got, err := lb.Select(forwarded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.URL.String() != want.URL.String() {
+				t.Fatalf("trusted=%v client=%s: got %s, want %s", trusted, client, got.URL, want.URL)
+			}
+		}
 	}
 }
 

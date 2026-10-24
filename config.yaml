@@ -1,5 +1,8 @@
 port: 8080
 
+# Trust forwarding headers only from explicitly configured proxy CIDRs.
+trusted_proxies: []
+
 # Maximum request body buffered for upstream retries (10 MiB by default).
 max_request_body_bytes: 10485760
 

@@ -2,22 +2,23 @@ package ratelimit
 
 import (
 	"math"
-	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/aditya-rai-5/reverse_proxy/clientip"
 
 	"golang.org/x/time/rate"
 )
 
 // Config defines the configuration for token bucket rate limiting.
 type Config struct {
-	RequestsPerMinute int           `yaml:"requests_per_minute"`
-	Burst             int           `yaml:"burst"`
-	TTL               time.Duration `yaml:"ttl,omitempty"`
-	CleanupInterval   time.Duration `yaml:"cleanup_interval,omitempty"`
+	ClientIPResolver  *clientip.Resolver `yaml:"-"`
+	RequestsPerMinute int                `yaml:"requests_per_minute"`
+	Burst             int                `yaml:"burst"`
+	TTL               time.Duration      `yaml:"ttl,omitempty"`
+	CleanupInterval   time.Duration      `yaml:"cleanup_interval,omitempty"`
 }
 
 // Defaults applies default values for zero fields.
@@ -45,15 +46,16 @@ type client struct {
 
 // Limiter manages per-IP rate limiters using the token bucket algorithm.
 type Limiter struct {
-	mu              sync.Mutex
-	clients         map[string]*client
-	rate            rate.Limit
-	burst           int
-	requestsPerMin  int
-	ttl             time.Duration
-	cleanupInterval time.Duration
-	stopCh          chan struct{}
-	stopOnce        sync.Once
+	clientIPResolver *clientip.Resolver
+	mu               sync.Mutex
+	clients          map[string]*client
+	rate             rate.Limit
+	burst            int
+	requestsPerMin   int
+	ttl              time.Duration
+	cleanupInterval  time.Duration
+	stopCh           chan struct{}
+	stopOnce         sync.Once
 }
 
 // New creates a new Limiter with the given configuration.
@@ -68,13 +70,14 @@ func New(cfg Config) *Limiter {
 	}
 
 	l := &Limiter{
-		clients:         make(map[string]*client),
-		rate:            r,
-		burst:           cfg.Burst,
-		requestsPerMin:  cfg.RequestsPerMinute,
-		ttl:             cfg.TTL,
-		cleanupInterval: cfg.CleanupInterval,
-		stopCh:          make(chan struct{}),
+		clientIPResolver: cfg.ClientIPResolver,
+		clients:          make(map[string]*client),
+		rate:             r,
+		burst:            cfg.Burst,
+		requestsPerMin:   cfg.RequestsPerMinute,
+		ttl:              cfg.TTL,
+		cleanupInterval:  cfg.CleanupInterval,
+		stopCh:           make(chan struct{}),
 	}
 
 	go l.cleanupLoop()
@@ -96,7 +99,7 @@ func (l *Limiter) AllowRequest(r *http.Request) bool {
 	if l == nil {
 		return true
 	}
-	ip := ExtractClientIP(r)
+	ip := l.clientIPResolver.Resolve(r)
 	return l.Allow(ip)
 }
 
@@ -218,30 +221,8 @@ func (l *Limiter) getClient(ip string) *rate.Limiter {
 	return c.limiter
 }
 
-// ExtractClientIP extracts the client IP address from request headers or RemoteAddr.
+// ExtractClientIP returns the immediate peer IP, ignoring forwarding headers.
+// It returns an empty string for a missing or invalid peer.
 func ExtractClientIP(r *http.Request) string {
-	if r == nil {
-		return "127.0.0.1"
-	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		ip := strings.TrimSpace(parts[0])
-		if ip != "" {
-			return ip
-		}
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		ip := strings.TrimSpace(xri)
-		if ip != "" {
-			return ip
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && host != "" {
-		return host
-	}
-	if r.RemoteAddr != "" {
-		return r.RemoteAddr
-	}
-	return "127.0.0.1"
+	return (*clientip.Resolver)(nil).Resolve(r)
 }
