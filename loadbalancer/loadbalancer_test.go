@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aditya-rai-5/reverse_proxy/circuitbreaker"
@@ -808,6 +809,65 @@ func TestMarkHealthyPreservesCircuitBreaker(t *testing.T) {
 					t.Errorf("Expected open circuit to prevent selection before cooldown, got %v", err)
 				}
 			}
+		})
+	}
+}
+
+func TestCircuitBreakerRecoveryAfterHealthyProbe(t *testing.T) {
+	for _, success := range []bool{true, false} {
+		t.Run(fmt.Sprintf("success=%t", success), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				lb, err := New([]config.Backend{{URL: "http://server1"}}, WithCircuitBreaker(circuitbreaker.Config{
+					FailureThreshold: 1,
+					Cooldown:         time.Second,
+				}))
+				if err != nil {
+					t.Fatalf("Failed to create load balancer: %v", err)
+				}
+				lb.RecordFailure(lb.BackendURL(0))
+				lb.MarkHealthy(0, true)
+				if _, err := lb.Select(nil); !errors.Is(err, ErrNoHealthyBackend) {
+					t.Fatalf("Expected selection blocked during cooldown, got %v", err)
+				}
+
+				// Virtual time makes cooldown checks deterministic without a real wait.
+				time.Sleep(time.Second)
+				lb.MarkHealthy(0, false)
+				if _, err := lb.Select(nil); !errors.Is(err, ErrNoHealthyBackend) {
+					t.Fatalf("Expected unhealthy backend to remain unavailable after cooldown, got %v", err)
+				}
+				lb.MarkHealthy(0, true)
+				result, err := lb.Select(nil)
+				if err != nil {
+					t.Fatalf("Expected recovery request after cooldown: %v", err)
+				}
+				if got := lb.CircuitBreakerState(0); got != circuitbreaker.StateHalfOpen {
+					t.Fatalf("Expected half-open circuit, got %s", got)
+				}
+				lb.MarkHealthy(0, true)
+				if got := lb.CircuitBreakerState(0); got != circuitbreaker.StateHalfOpen {
+					t.Fatalf("Expected healthy probe to preserve half-open circuit, got %s", got)
+				}
+
+				if success {
+					lb.RecordSuccess(result.URL)
+					if got := lb.CircuitBreakerState(0); got != circuitbreaker.StateClosed {
+						t.Errorf("Expected successful request to close circuit, got %s", got)
+					}
+					if got := lb.ConsecutiveFailures(0); got != 0 {
+						t.Errorf("Expected successful request to clear failures, got %d", got)
+					}
+				} else {
+					lb.RecordFailure(result.URL)
+					lb.MarkHealthy(0, true)
+					if got := lb.CircuitBreakerState(0); got != circuitbreaker.StateOpen {
+						t.Errorf("Expected failed request to reopen circuit, got %s", got)
+					}
+					if _, err := lb.Select(nil); !errors.Is(err, ErrNoHealthyBackend) {
+						t.Errorf("Expected reopened circuit to block selection, got %v", err)
+					}
+				}
+			})
 		})
 	}
 }
