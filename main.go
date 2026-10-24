@@ -27,6 +27,7 @@ func buildHandler(cfg *config.Config, r *router.Router, observers ...proxy.Reque
 	var handler http.Handler = proxyHandler
 	if cfg.RateLimit != nil && cfg.RateLimit.Enabled() {
 		rl := ratelimit.New(ratelimit.Config{
+			ClientIPResolver:  r.ClientIPResolver(),
 			RequestsPerMinute: cfg.RateLimit.RequestsPerMinute,
 			Burst:             cfg.RateLimit.Burst,
 		})
