@@ -2,6 +2,7 @@ package healthcheck
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aditya-rai-5/reverse_proxy/circuitbreaker"
 	"github.com/aditya-rai-5/reverse_proxy/config"
 	"github.com/aditya-rai-5/reverse_proxy/loadbalancer"
 )
@@ -193,5 +195,51 @@ func TestBuildProbeURL(t *testing.T) {
 	expected := "http://localhost:8080/ping"
 	if probeURL != expected {
 		t.Errorf("buildProbeURL() = %q, expected %q", probeURL, expected)
+	}
+}
+
+func TestProbeHealthyBackendPreservesOpenCircuit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	const failures = 3
+	lb, err := loadbalancer.New([]config.Backend{{URL: server.URL}}, loadbalancer.WithCircuitBreaker(circuitbreaker.Config{
+		FailureThreshold: failures,
+		Cooldown:         time.Hour,
+	}))
+	if err != nil {
+		t.Fatalf("Failed to create load balancer: %v", err)
+	}
+	for i := 0; i < failures; i++ {
+		lb.RecordFailure(lb.BackendURL(0))
+	}
+	if got := lb.CircuitBreakerState(0); got != circuitbreaker.StateOpen {
+		t.Fatalf("Expected open circuit before probe, got %s", got)
+	}
+	lb.MarkHealthy(0, false)
+
+	checker := New(lb, "/test", config.HealthCheck{
+		Path:    "/health",
+		Timeout: time.Second,
+	})
+	checker.probe(0, server.URL+"/health")
+
+	if !lb.IsHealthy(0) {
+		t.Error("Expected backend to be probe-healthy after HTTP 200")
+	}
+	if got := lb.CircuitBreakerState(0); got != circuitbreaker.StateOpen {
+		t.Errorf("Expected successful probe to preserve open circuit, got %s", got)
+	}
+	if got := lb.ConsecutiveFailures(0); got != failures {
+		t.Errorf("Expected %d application failures to be preserved, got %d", failures, got)
+	}
+	if _, err := lb.Select(nil); !errors.Is(err, loadbalancer.ErrNoHealthyBackend) {
+		t.Errorf("Expected open circuit to prevent selection before cooldown, got %v", err)
 	}
 }

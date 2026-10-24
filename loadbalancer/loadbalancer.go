@@ -362,11 +362,9 @@ func (lb *LoadBalancer) ConsecutiveFailures(idx int) int {
 }
 
 // MarkHealthy sets the health state of the backend at the given index.
+// Note that this method does not reset the circuit breaker.
 func (lb *LoadBalancer) MarkHealthy(idx int, healthy bool) {
 	lb.backends[idx].healthy.Store(healthy)
-	if healthy {
-		lb.backends[idx].cb.RecordSuccess()
-	}
 }
 
 // IsHealthy reports the current health state of the backend at index idx.
