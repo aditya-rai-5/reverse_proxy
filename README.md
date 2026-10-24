@@ -167,7 +167,7 @@ Unhealthy backends and open circuits are skipped during selection.
 - `max_request_body_bytes` defaults to `10485760` (10 MiB) when omitted or zero. It limits retry buffering, **not upload size**: larger bodies stream to one backend without retries.
 - `health_check` defaults to `/health`, a `10s` interval, and a `5s` timeout. Probes use the backend's scheme and host plus this path, without route rewriting. Non-`2xx` responses and connection failures mark a backend unhealthy.
 - `timeout` is a per-attempt upstream timeout, such as `3s`. Omitted or zero adds no route-specific deadline.
-- `circuit_breaker` defaults to a failure threshold of `5` and a `10s` cooldown, even when the section is omitted. After cooldown, a half-open circuit allows a recovery attempt.
+- `circuit_breaker` defaults to a failure threshold of `5` and a `10s` cooldown, even when the section is omitted. Successful health probes update backend health but do not clear circuit-breaker failures, close the circuit, or bypass cooldown. After cooldown, a healthy backend becomes eligible for application requests in the half-open state. A successful application request closes the circuit and clears its failures; a failed application request reopens it.
 - `rate_limit.requests_per_minute` enables per-IP limiting when positive. Omitted or zero disables that limiter. For an enabled limiter, omitted or zero `burst` defaults to `1`.
 
 A route may also define its own `rate_limit` section. Global and route limits both apply; a route limit does not replace the global limit. `/healthz` and `/metrics` bypass these proxy request limiters.
