@@ -2,11 +2,15 @@
 
 An HTTP reverse proxy written in Go, with path-based routing, five load balancing algorithms, backend health checks, safe retries, circuit breakers, rate limiting, HTTPS termination, and Prometheus metrics.
 
-Start with the Docker demo for a working stack with mock backends and monitoring, or run the proxy locally against your own upstream services.
+Start with the Docker demo for mock backends and monitoring, or run the proxy locally against your own upstream services.
+
+The core HTTP features are implemented and tested. The project still has correctness and operational gaps described under [Current limitations](#current-limitations); it does not yet have a production capacity or reliability baseline.
 
 ## Contents
 
 - [Features](#features)
+- [Current limitations](#current-limitations)
+- [Project structure](#project-structure)
 - [Quick start: Docker demo](#quick-start-docker-demo)
 - [Run locally](#run-locally)
 - [Configuration](#configuration)
@@ -15,7 +19,8 @@ Start with the Docker demo for a working stack with mock backends and monitoring
 - [Health and monitoring](#health-and-monitoring)
 - [Troubleshooting](#troubleshooting)
 - [Development and contributions](#development-and-contributions)
-- [Dependency bots](#dependency-bots)
+- [Dependency maintenance](#dependency-maintenance)
+- [License](#license)
 
 ## Features
 
@@ -24,10 +29,50 @@ Start with the Docker demo for a working stack with mock backends and monitoring
 - Round-robin, weighted round-robin, least connections, IP hash, and cookie-based sticky sessions.
 - Background health checks, automatic backend failover, and per-backend circuit breakers.
 - Global and per-route token bucket rate limits with HTTP `429` and `Retry-After` responses.
+- Shared client-IP resolution for rate limiting and IP hashing, with explicit trusted-proxy CIDRs.
 - Configurable retries with bounded request body buffering and explicit write-method safeguards.
 - HTTPS using certificate files or automatic Let's Encrypt certificates.
 - JSON backend status at `/healthz` and Prometheus metrics at `/metrics`.
-- Graceful shutdown on `SIGINT` or `SIGTERM`, with up to 10 seconds to drain requests.
+- Signal-driven HTTP shutdown on `SIGINT` or `SIGTERM`, with a shared 10-second server drain deadline. Active health probes can extend total exit time.
+- GitHub Actions build, vet, race-test, Compose-validation, and Docker-build jobs.
+
+## Current limitations
+
+Review scope: source and local validation at commit `2565da1` on **2026-10-25**. These are current implementation limits, not claims that every deployment will encounter them.
+
+- **HTTP correctness:** headers named by `Connection` are not removed, `Trailer` handling is incomplete, and `X-Forwarded-Proto` is not sanitized or generated. Do not treat that header as an authenticated scheme signal.
+- **URL forwarding:** use backend origin URLs such as `http://backend:9001`. Backend base paths and queries are ignored, and encoded path separators such as `%2F` are decoded during forwarding.
+- **Response failures:** upstream body-copy errors are ignored after response headers are sent; a truncated response can still count as a backend success.
+- **Configuration:** unknown YAML keys, invalid plain-HTTP port ranges, relative paths/URLs, and duplicate routes are not fully rejected. Review settings carefully; there is no `--check-config` command.
+- **Resource controls:** listener read/header/write/idle timeouts are unset. A positive route `timeout` limits each upstream attempt, but does not cover initial retry-body buffering or impose a total request deadline. Upload size, concurrent buffers, and tracked limiter identities have no configured hard cap.
+- **Recovery and lifecycle:** half-open breakers admit multiple requests, late successes can close an open breaker, listener failures currently exit with status zero, and shutdown does not explicitly stop all limiter/transport resources.
+- **Operations:** `/healthz` and `/metrics` share the application listener without authentication and bypass rate limits. `/healthz` reports aggregate backend condition, not separate liveness/readiness. Rate limits and resilience state are local to each process. Sticky cookies have limited security/scoping controls.
+- **Protocols and deployment:** WebSocket/CONNECT tunnels, reliable SSE flushing, response trailers, and validated gRPC support are not implemented. Live ACME issuance, the running Compose stack, load behavior, and release deployment were not verified in this review.
+
+Configuration reload, dynamic service discovery, authentication middleware, distributed rate limits, and release publishing are also outside the current implementation. Report reproducible bugs using the [contribution guide](CONTRIBUTING.md#report-a-bug-or-propose-a-feature).
+
+## Project structure
+
+```text
+main.go                 Startup, middleware, signals, and shutdown
+server.go               HTTP/HTTPS listeners and redirects
+health.go               Aggregate backend status endpoint
+config/                 YAML settings, defaults, and validation
+router/                 Route matching, rewrites, and retry eligibility
+proxy/                  Forwarding, body replay, and request observations
+clientip/               Trusted-proxy client-IP resolution
+loadbalancer/           Five backend-selection algorithms
+circuitbreaker/         Application failure and recovery state
+healthcheck/            Periodic backend HTTP probes
+ratelimit/              In-memory per-IP token buckets
+metrics/                Prometheus text exposition
+config.yaml             Local upstream example
+demo/config.yaml        Docker demo routes
+prometheus/, grafana/    Scraping and dashboard provisioning
+.github/                CI and dependency-update configuration
+```
+
+Tests live beside their implementation, with application integration and TLS setup tests at the root. Configuration is loaded once at startup; runtime state is held in memory. Normal requests pass through global limiting, route matching, route limiting, backend selection, and forwarding. Management endpoints are registered separately.
 
 ## Quick start: Docker demo
 
@@ -69,11 +114,11 @@ Prometheus and Grafana data remain in named volumes. To also delete that demo da
 docker compose down -v
 ```
 
-The bundled Grafana credentials are for the local demo only.
+The bundled Grafana credentials are for the local demo only. Compose publishes ports `8080`, `9090`, and `3000` on all host interfaces by default; restrict exposure when running on a shared host. The intentional breaker failures can also make the proxy container report unhealthy while `/api` still works.
 
 ## Run locally
 
-Requires Git and **Go 1.27.1**, as declared in [go.mod](go.mod). Docker is optional for this workflow.
+Requires Git and **Go 1.27.1 or newer**, as declared in [go.mod](go.mod). The [Dockerfile](Dockerfile) currently builds with Go 1.27.2. Docker is optional for this workflow.
 
 ```bash
 git clone https://github.com/aditya-rai-5/reverse_proxy.git
@@ -139,11 +184,11 @@ routes:
         weight: 1
 ```
 
-With this configuration, `/api/users` reaches an upstream as `/users`. An unrelated path has no matching route. Add a route with `path: /` if you want a catch-all.
+With this configuration, `/api/users` reaches an upstream as `/users`. An unrelated path has no matching route and returns `502`. Add a route with `path: /` if you want a catch-all.
 
 ### Routing and load balancing
 
-Routes are evaluated by longest matching path, independently of their order in YAML. Prefix stripping runs before regex rewriting. For example, this optional route field rewrites `/legacy/users` to `/v2/users`:
+Give each route a unique absolute path. Routes are evaluated by longest matching path, independently of their order in YAML. `/api/` matches descendants but not the bare `/api`; `/healthz` and `/metrics` are reserved by the application mux. Prefix stripping runs before regex rewriting. For example, this optional route field rewrites `/legacy/users` to `/v2/users`:
 
 ```yaml
 rewrite:
@@ -156,8 +201,8 @@ Choose a route's `algorithm`:
 - `round_robin`: rotates across healthy backends; the default when no custom weights are supplied.
 - `weighted_round_robin`: distributes requests using smooth weighted round-robin. A backend's omitted or zero `weight` becomes `1`. If `algorithm` is omitted and any weight exceeds `1`, weighted round-robin is selected automatically.
 - `least_conn`: selects the healthy backend with the fewest active requests.
-- `ip_hash`: selects a backend using the client IP.
-- `sticky`: keeps a client on a backend using a cookie. Set `cookie_name` to customize its name; the default is `SERVERID`.
+- `ip_hash`: selects a backend using the client IP. It hashes over the currently available backend list, so health changes can remap clients.
+- `sticky`: keeps a client on a backend using a cookie. Set a distinct `cookie_name` for each sticky route; the default is `SERVERID`. Cookies use `Path=/` and `HttpOnly`, without explicit `Secure`, `SameSite`, or expiry attributes.
 
 Unhealthy backends and open circuits are skipped during selection.
 
@@ -212,11 +257,13 @@ client-IP header is forwarded.
 
 ## Retry safety
 
-`retries` sets the number of **additional attempts** after the initial request:
+`retries` sets the number of **additional proxy-loop attempts** after the initial request:
 
 - Omitted or `null`: defaults to `min(number of backends - 1, 2)`.
 - `retries: 0`: disables retries, including on routes with multiple backends.
 - A positive value: sets an explicit retry budget. Actual attempts also depend on eligible, available backends.
+
+The proxy loop excludes backend URLs already attempted, so a single backend is not retried by that loop. Go's HTTP transport can also replay eligible requests internally on certain connection failures; the configured count is not an exact wire-attempt counter. Replayability is suppressed when route policy disallows retries.
 
 The effective budget, including zero, is reported by `/healthz`. Retries can follow upstream `502` or `504` responses, connection errors, or per-attempt timeouts. They are not triggered by every `5xx` response.
 
@@ -279,9 +326,22 @@ Keep private keys and certificate caches out of commits. The bundled Docker demo
 
 `GET /healthz` returns JSON with overall status, route algorithms, retry budgets, retry methods, rate limits, and backend details. Those details include health and circuit state, with weights, active connections, and failure counters where applicable.
 
-It returns `200` when all backends are healthy and no circuit is open, or `503` with status `degraded` otherwise. A degraded result does not necessarily mean every route is unavailable.
+It returns `200` when all backends are probe-healthy and no circuit is open, or `503` with status `degraded` otherwise. A degraded result does not necessarily mean every route is unavailable. Backends start healthy before their first probe, and half-open circuits do not by themselves make the response degraded. The handlers do not restrict requests to GET.
+
+Both management endpoints expose configured backend URLs. Keep them behind appropriate network/access controls and avoid credentials in backend URLs.
 
 `GET /metrics` exposes Prometheus text metrics for requests, latency, backend health, rate-limit rejections, and circuit breakers. The demo includes [Prometheus configuration](prometheus/prometheus.yml) and a provisioned [Grafana dashboard](grafana/dashboards/reverse-proxy.json).
+
+Metrics use configured route/backend labels rather than individual request paths:
+
+- `http_requests_total{route,backend,status_code}` counts completed proxy-handler requests.
+- `http_request_duration_seconds` exposes a latency histogram in seconds with the same labels.
+- `rate_limit_rejections_total{route}` includes route rejections and `route="global"` for global rejections.
+- `backend_healthy_gauge{route,backend}` reports probe health as `0` or `1`.
+- `circuit_breaker_state{route,backend,state}` reports one active state per backend.
+- `circuit_breaker_trips_total{route,backend}` counts transitions into the open state.
+
+Global rate-limit rejections bypass the request counter/histogram; route rejections enter both request and rejection metrics. Retries produce one final request observation labeled with the last backend, not one observation per attempt. Management requests are excluded. Counters reset when the process restarts.
 
 For a Prometheus instance running directly on the same host:
 
@@ -302,7 +362,7 @@ Inside a container, `localhost` refers to that container. The Compose setup uses
 - **`503` response:** inspect `/healthz` for unhealthy backends or open circuits. Verify upstream `/health` responses and the configured probe path.
 - **`429` response:** check global and route rate limits; the demo's `/limited` route intentionally rejects excess traffic.
 - **Empty dashboard:** check `docker compose ps` and `docker compose logs proxy prometheus traffic-generator`, then allow time for scrapes and traffic to accumulate.
-- **Go build fails:** check `go version` against [go.mod](go.mod) and ensure dependencies can be downloaded. The Docker build pins the same Go version.
+- **Go build fails:** check `go version` against [go.mod](go.mod) and ensure dependencies can be downloaded. The Dockerfile pins its own compatible patch version.
 
 ## Development and contributions
 
@@ -323,18 +383,12 @@ For coverage:
 go test -cover ./...
 ```
 
-## Dependency bots
+## Dependency maintenance
 
-Two bots share dependency maintenance without opening duplicate updates:
+Repository configuration assigns Go modules and GitHub Actions to [Dependabot](.github/dependabot.yml), scheduled weekly on Monday at 09:00 Asia/Kolkata. [Renovate](.github/renovate.json) handles Dockerfile and Compose images, excludes the locally built demo image, enables a Dependency Dashboard, and requires dashboard approval for major image upgrades. Renovate automerge is disabled in its configuration.
 
-- **Dependabot** checks Go modules and GitHub Actions every Monday at 09:00 Asia/Kolkata. Its configuration is in [.github/dependabot.yml](.github/dependabot.yml). Minor and patch Go updates are grouped; major Go updates remain separate.
-- **Renovate** checks Dockerfile base images and Docker Compose images. Its configuration is in [.github/renovate.json](.github/renovate.json). The locally built `reverse-proxy-demo` image is excluded. Renovate creates and maintains a **Dependency Dashboard** issue; approve major container upgrades there before it opens their pull requests.
+These files describe intended automation. The hosted Renovate app still requires repository access, and bot installation, repository security settings, and current remote CI results are not verified by a local checkout review. The [CI workflow](.github/workflows/ci.yml) verifies modules, builds, vets, runs race tests, validates Compose, and builds the image; it does not start the full demo stack.
 
-To activate the bots:
+## License
 
-1. Merge these configuration files into the repository's default branch, `main`. Dependabot version updates start from the checked-in configuration; inspect **Insights → Dependency graph → Dependabot** for update jobs.
-2. [Install the Renovate GitHub App](https://github.com/apps/renovate), choose **Only select repositories**, and select `aditya-rai-5/reverse_proxy`. If an onboarding PR appears, review and merge it, preserving the manager split above.
-3. In **Settings → Advanced Security** (called **Code security and analysis** in some GitHub interfaces), enable **Dependency graph**, **Dependabot alerts**, and **Dependabot security updates** if available. Security alerts and security update PRs are separate from weekly version updates.
-4. Check the **Actions** tab for the [CI workflow](.github/workflows/ci.yml). It builds and vets Go code, runs the race tests, validates Compose, and builds the proxy Docker image. Review passing bot PRs before merging; automerge is disabled. Image builds do not verify the running demo stack.
-
-The dashboard tracks dependency work; these bots do not discover arbitrary application bugs or propose new product features. Update PRs appear when eligible updates exist, so immediate PR activity is not guaranteed. Opening an issue or installing a bot does not itself create a code contribution. Contributor displays are controlled by GitHub; do not rely on installation alone to add a bot to the Contributors list.
+Released under the [MIT License](LICENSE).
