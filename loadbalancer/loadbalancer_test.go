@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/aditya-rai-5/reverse_proxy/circuitbreaker"
 	"github.com/aditya-rai-5/reverse_proxy/clientip"
 	"github.com/aditya-rai-5/reverse_proxy/config"
 )
@@ -755,6 +757,58 @@ func TestCircuitBreakerTripsAfter5ConsecutiveFailures(t *testing.T) {
 	}
 	if lb.ConsecutiveFailures(0) != 0 {
 		t.Errorf("Expected 0 failures after success, got %d", lb.ConsecutiveFailures(0))
+	}
+}
+
+func TestMarkHealthyPreservesCircuitBreaker(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		failures      int
+		markUnhealthy bool
+		wantState     circuitbreaker.State
+	}{
+		{name: "below threshold", failures: 2, wantState: circuitbreaker.StateClosed},
+		{name: "open circuit", failures: 3, wantState: circuitbreaker.StateOpen},
+		{name: "health recovery", failures: 3, markUnhealthy: true, wantState: circuitbreaker.StateOpen},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lb, err := New([]config.Backend{{URL: "http://server1"}}, WithCircuitBreaker(circuitbreaker.Config{
+				FailureThreshold: 3,
+				Cooldown:         time.Hour,
+			}))
+			if err != nil {
+				t.Fatalf("Failed to create load balancer: %v", err)
+			}
+			for i := 0; i < tc.failures; i++ {
+				lb.RecordFailure(lb.BackendURL(0))
+			}
+			if got := lb.CircuitBreakerState(0); got != tc.wantState {
+				t.Fatalf("Before health update: expected state %s, got %s", tc.wantState, got)
+			}
+			if tc.markUnhealthy {
+				lb.MarkHealthy(0, false)
+				if lb.IsHealthy(0) {
+					t.Fatal("Expected backend to be unhealthy")
+				}
+			}
+
+			lb.MarkHealthy(0, true)
+
+			if !lb.IsHealthy(0) {
+				t.Error("Expected backend to be probe-healthy")
+			}
+			if got := lb.ConsecutiveFailures(0); got != tc.failures {
+				t.Errorf("Expected %d application failures to be preserved, got %d", tc.failures, got)
+			}
+			if got := lb.CircuitBreakerState(0); got != tc.wantState {
+				t.Errorf("Expected circuit state %s to be preserved, got %s", tc.wantState, got)
+			}
+			if tc.wantState == circuitbreaker.StateOpen {
+				if _, err := lb.Select(nil); !errors.Is(err, ErrNoHealthyBackend) {
+					t.Errorf("Expected open circuit to prevent selection before cooldown, got %v", err)
+				}
+			}
+		})
 	}
 }
 
