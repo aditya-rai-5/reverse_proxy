@@ -2,17 +2,17 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/aditya-rai-5/reverse_proxy/config"
-	"github.com/aditya-rai-5/reverse_proxy/healthcheck"
-	"github.com/aditya-rai-5/reverse_proxy/metrics"
 	"github.com/aditya-rai-5/reverse_proxy/proxy"
 	"github.com/aditya-rai-5/reverse_proxy/ratelimit"
 	"github.com/aditya-rai-5/reverse_proxy/router"
@@ -20,11 +20,17 @@ import (
 
 // buildHandler creates the proxy handler and applies the global rate limiting middleware if configured.
 func buildHandler(cfg *config.Config, r *router.Router, observers ...proxy.RequestObserver) http.Handler {
+	handler, _ := buildManagedHandler(cfg, r, observers...)
+	return handler
+}
+
+func buildManagedHandler(cfg *config.Config, r *router.Router, observers ...proxy.RequestObserver) (http.Handler, func()) {
 	proxyHandler := proxy.NewWithTransportAndBodyLimit(r, nil, cfg.MaxRequestBodyBytes)
 	if len(observers) > 0 {
 		proxyHandler.SetRequestObserver(observers[0])
 	}
 	var handler http.Handler = proxyHandler
+	cleanup := proxyHandler.CloseIdleConnections
 	if cfg.RateLimit != nil && cfg.RateLimit.Enabled() {
 		rl := ratelimit.New(ratelimit.Config{
 			ClientIPResolver:  r.ClientIPResolver(),
@@ -38,41 +44,57 @@ func buildHandler(cfg *config.Config, r *router.Router, observers ...proxy.Reque
 			}
 		}
 		handler = rl.Middleware(handler, onRejected)
+		cleanup = func() { rl.Stop(); proxyHandler.CloseIdleConnections() }
 	}
-	return handler
+	return handler, cleanup
 }
 
 func main() {
-	cfg, err := config.Load("config.yaml")
-	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		log.Fatal(err)
 	}
+}
 
-	r, err := router.New(cfg)
+func run(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("reverse_proxy", flag.ContinueOnError)
+	flags.SetOutput(output)
+	path := flags.String("config", "config.yaml", "configuration file path")
+	check := flags.Bool("check-config", false, "validate configuration and exit")
+	if err := flags.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected positional arguments")
+	}
+	cfg, err := config.Load(*path)
 	if err != nil {
-		log.Fatalf("failed to build router: %v", err)
+		return err
+	}
+	if *check {
+		if cfg.TLS != nil && !cfg.TLS.AutoCert {
+			if _, err := newServers(cfg, nil); err != nil {
+				return err
+			}
+		}
+		fmt.Fprintln(output, "Configuration valid")
+		return nil
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
-	// Start health checkers for every route's backends.
-	var hcWg sync.WaitGroup
-	for _, entry := range r.Entries() {
-		hc := healthcheck.New(entry.LB, entry.Path, cfg.HealthCheck)
-		hc.Start(ctx, &hcWg)
-	}
-
-	proxyMetrics := metrics.New(r)
-	handler := buildHandler(cfg, r, proxyMetrics)
-
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", proxyMetrics.Handler())
-	mux.Handle("/", handler)
-	mux.HandleFunc("/healthz", makeHealthzHandler(r, cfg))
-
-	servers, err := newServers(cfg, mux)
+	reloads := make(chan os.Signal, 1)
+	signal.Notify(reloads, syscall.SIGHUP)
+	defer signal.Stop(reloads)
+	runtime, err := newRuntime(ctx, cfg)
 	if err != nil {
-		log.Fatalf("failed to configure listeners: %v", err)
+		return err
+	}
+	defer runtime.close()
+	servers, err := newServers(cfg, runtime)
+	if err != nil {
+		return err
 	}
 	for _, srv := range servers.all() {
 		protocol := "HTTP"
@@ -90,7 +112,19 @@ func main() {
 	log.Printf("Health check: path=%s interval=%s timeout=%s",
 		cfg.HealthCheck.Path, cfg.HealthCheck.Interval, cfg.HealthCheck.Timeout)
 
-	<-ctx.Done()
+running:
+	for {
+		select {
+		case <-ctx.Done():
+			break running
+		case <-reloads:
+			if err := runtime.reload(*path); err != nil {
+				log.Printf("configuration reload rejected: %v", err)
+			} else {
+				log.Printf("configuration reloaded from %s", *path)
+			}
+		}
+	}
 	log.Println("Shutting down…")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -98,9 +132,9 @@ func main() {
 	for _, srv := range servers.all() {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("graceful shutdown error for %s: %v", srv.Addr, err)
+			_ = srv.Close()
 		}
 	}
 
-	hcWg.Wait()
-	log.Println("All health checkers stopped. Bye!")
+	return nil
 }
