@@ -363,3 +363,10 @@ func copyHeader(dst, src http.Header) {
 		}
 	}
 }
+
+// CloseIdleConnections releases pooled idle backend connections.
+func (h *Handler) CloseIdleConnections() {
+	if t, ok := h.transport.(interface{ CloseIdleConnections() }); ok {
+		t.CloseIdleConnections()
+	}
+}

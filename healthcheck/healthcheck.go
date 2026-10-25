@@ -52,7 +52,7 @@ func (c *Checker) runProbe(ctx context.Context, idx int) {
 	log.Printf("[HEALTH] starting probe for route=%q backend=%s probe=%s interval=%s",
 		c.routePath, backendURL, probeURL, c.cfg.Interval)
 
-	c.probe(idx, probeURL)
+	c.probeContext(ctx, idx, probeURL)
 
 	ticker := time.NewTicker(c.cfg.Interval)
 	defer ticker.Stop()
@@ -63,16 +63,26 @@ func (c *Checker) runProbe(ctx context.Context, idx int) {
 			log.Printf("[HEALTH] stopping probe for route=%q backend=%s", c.routePath, backendURL)
 			return
 		case <-ticker.C:
-			c.probe(idx, probeURL)
+			c.probeContext(ctx, idx, probeURL)
 		}
 	}
 }
 
 func (c *Checker) probe(idx int, probeURL string) {
-	backendURL := c.lb.BackendURL(idx)
+	c.probeContext(context.Background(), idx, probeURL)
+}
 
-	resp, err := c.client.Get(probeURL) //nolint:noctx // context is implicit via client.Timeout
+func (c *Checker) probeContext(ctx context.Context, idx int, probeURL string) {
+	backendURL := c.lb.BackendURL(idx)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
+		return
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		if c.lb.IsHealthy(idx) {
 			log.Printf("[HEALTH] ✗ route=%q backend=%s UNHEALTHY: %v", c.routePath, backendURL, err)
 		}
