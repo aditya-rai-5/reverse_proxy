@@ -79,14 +79,13 @@ func TestLoadRetryBudget(t *testing.T) {
 func TestLoadRetryBudgetYAMLMerges(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := `port: 8080
-defaults: &defaults
-  retries: 0
-  backends:
-    - url: http://one.example
-    - url: http://two.example
 routes:
-  - <<: *defaults
+  - &defaults
     path: /disabled
+    retries: 0
+    backends:
+      - url: http://one.example
+      - url: http://two.example
   - <<: *defaults
     path: /enabled
     retries: 2
