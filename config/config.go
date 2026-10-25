@@ -1,11 +1,18 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"os"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/aditya-rai-5/reverse_proxy/clientip"
 
@@ -101,9 +108,13 @@ type Route struct {
 func (r *Route) UnmarshalYAML(node *yaml.Node) error {
 	type plainRoute Route
 	var decoded plainRoute
+	if err := checkFields(node, reflect.TypeOf(decoded), make(map[*yaml.Node]bool)); err != nil {
+		return err
+	}
 	if err := node.Decode(&decoded); err != nil {
 		return err
 	}
+
 	var settings struct {
 		Retries *int `yaml:"retries"`
 	}
@@ -205,12 +216,16 @@ func Load(path string) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// Apply defaults before validation so validate() sees resolved values.
-	cfg.HealthCheck.defaults()
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("config must contain exactly one YAML document")
+	}
 
 	if err := validate(&cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -223,8 +238,8 @@ func validate(cfg *Config) error {
 	if _, err := clientip.NewResolver(cfg.TrustedProxies); err != nil {
 		return err
 	}
-	if cfg.Port == 0 {
-		return fmt.Errorf("port must be specified")
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
 	}
 	if cfg.MaxRequestBodyBytes < 0 {
 		return fmt.Errorf("max_request_body_bytes must be non-negative")
@@ -269,16 +284,30 @@ func validate(cfg *Config) error {
 		}
 		cfg.RateLimit.Defaults()
 	}
+	if cfg.HealthCheck.Interval < 0 || cfg.HealthCheck.Timeout < 0 {
+		return fmt.Errorf("health_check durations must be non-negative")
+	}
+	cfg.HealthCheck.defaults()
+	if err := validatePath(cfg.HealthCheck.Path); err != nil {
+		return fmt.Errorf("health_check.path: %w", err)
+	}
 	if len(cfg.Routes) == 0 {
 		return fmt.Errorf("at least one route must be defined")
 	}
+	seenPaths := make(map[string]bool)
 	for i := range cfg.Routes {
 		route := &cfg.Routes[i]
-		if route.Path == "" {
-			return fmt.Errorf("route[%d]: path must not be empty", i)
+		if err := validatePath(route.Path); err != nil {
+			return fmt.Errorf("route[%d].path: %w", i, err)
 		}
-		if route.StripPrefix != "" && !strings.HasPrefix(route.StripPrefix, "/") {
-			return fmt.Errorf("route[%d]: strip_prefix must start with '/'", i)
+		if seenPaths[route.Path] {
+			return fmt.Errorf("route[%d]: duplicate path %q", i, route.Path)
+		}
+		seenPaths[route.Path] = true
+		if route.StripPrefix != "" {
+			if err := validatePath(route.StripPrefix); err != nil {
+				return fmt.Errorf("route[%d].strip_prefix: %w", i, err)
+			}
 		}
 		if route.Rewrite != nil {
 			if route.Rewrite.Pattern == "" {
@@ -301,8 +330,8 @@ func validate(cfg *Config) error {
 		hasCustomWeight := false
 		for j := range route.Backends {
 			backend := &route.Backends[j]
-			if backend.URL == "" {
-				return fmt.Errorf("route[%d].backend[%d]: url must not be empty", i, j)
+			if err := validateBackend(backend.URL); err != nil {
+				return fmt.Errorf("route[%d].backend[%d]: %w", i, j, err)
 			}
 			if backend.Weight < 0 {
 				return fmt.Errorf("route[%d].backend[%d]: weight must be non-negative", i, j)
@@ -338,6 +367,9 @@ func validate(cfg *Config) error {
 		if route.CircuitBreaker == nil {
 			route.CircuitBreaker = &CircuitBreakerConfig{}
 		}
+		if route.CircuitBreaker.FailureThreshold < 0 || route.CircuitBreaker.Cooldown < 0 {
+			return fmt.Errorf("route[%d]: circuit_breaker values must be non-negative", i)
+		}
 		route.CircuitBreaker.Defaults()
 
 		if route.RateLimit != nil {
@@ -348,6 +380,123 @@ func validate(cfg *Config) error {
 				return fmt.Errorf("route[%d]: rate_limit.burst must be non-negative", i)
 			}
 			route.RateLimit.Defaults()
+		}
+	}
+	return nil
+}
+
+// validatePath checks literal, decoded paths used by the router and probes.
+func validatePath(path string) error {
+	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") ||
+		strings.ContainsAny(path, "?#\\%") || strings.IndexFunc(path, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return fmt.Errorf("must be an absolute path without query, fragment, escapes, whitespace, or controls")
+	}
+	for _, part := range strings.Split(path, "/") {
+		if part == "." || part == ".." {
+			return fmt.Errorf("path must not contain dot segments")
+		}
+	}
+	if strings.Contains(path, "//") {
+		return fmt.Errorf("path must not contain repeated slashes")
+	}
+	return nil
+}
+
+func validateBackend(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid backend URL: %w", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.Opaque != "" ||
+		u.User != nil || u.RawQuery != "" || u.ForceQuery || strings.Contains(raw, "#") ||
+		(u.Path != "" && u.Path != "/") || u.RawPath != "" {
+		return fmt.Errorf("backend must be an absolute HTTP(S) origin URL without credentials, base path, query, or fragment")
+	}
+	host := u.Hostname()
+	if strings.Contains(u.Host, "[") {
+		if net.ParseIP(host) == nil {
+			return fmt.Errorf("invalid backend IP address")
+		}
+	} else {
+		if strings.Contains(host, ":") {
+			return fmt.Errorf("IPv6 backend addresses must be bracketed")
+		}
+		for _, label := range strings.Split(strings.TrimSuffix(host, "."), ".") {
+			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+				return fmt.Errorf("invalid backend hostname")
+			}
+			for _, c := range label {
+				if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+					return fmt.Errorf("invalid backend hostname")
+				}
+			}
+		}
+		if len(host) > 253 {
+			return fmt.Errorf("backend hostname too long")
+		}
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return fmt.Errorf("backend port must not be empty")
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("backend port must be between 1 and 65535")
+		}
+	}
+	return nil
+}
+
+// checkFields preserves YAML aliases and merges while enforcing the schema
+// inside Route.UnmarshalYAML, where Decoder.KnownFields does not propagate.
+func checkFields(node *yaml.Node, typ reflect.Type, visiting map[*yaml.Node]bool) error {
+	if visiting[node] {
+		return fmt.Errorf("cyclic YAML alias")
+	}
+	visiting[node] = true
+	defer delete(visiting, node)
+	if node.Kind == yaml.AliasNode {
+		return checkFields(node.Alias, typ, visiting)
+	}
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if node.Kind == yaml.SequenceNode && typ.Kind() == reflect.Slice {
+		for _, item := range node.Content {
+			if err := checkFields(item, typ.Elem(), visiting); err != nil {
+				return err
+			}
+		}
+	}
+	if node.Kind != yaml.MappingNode || typ.Kind() != reflect.Struct {
+		return nil
+	}
+	fields := make(map[string]reflect.Type)
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		name := strings.Split(field.Tag.Get("yaml"), ",")[0]
+		fields[name] = field.Type
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		if key.Tag == "!!merge" {
+			if value.Kind == yaml.SequenceNode {
+				for _, item := range value.Content {
+					if err := checkFields(item, typ, visiting); err != nil {
+						return err
+					}
+				}
+			} else if err := checkFields(value, typ, visiting); err != nil {
+				return err
+			}
+			continue
+		}
+		field, ok := fields[key.Value]
+		if !ok {
+			return fmt.Errorf("line %d: unknown field %q", key.Line, key.Value)
+		}
+		if err := checkFields(value, field, visiting); err != nil {
+			return err
 		}
 	}
 	return nil
