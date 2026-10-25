@@ -38,7 +38,7 @@ go build .
 go test ./...
 ```
 
-For local requests, start upstream services and edit root `config.yaml`, then run `go run .`. The application reads configuration from its current working directory. For a complete demo with mock services, use `docker compose up --build`; it uses `demo/config.yaml`. See the [README quick start](README.md#quick-start-docker-demo) for endpoints and credentials.
+For local requests, start upstream services and edit root `config.yaml`, then run `go run .`. The application defaults to `config.yaml` in its current working directory; use `--config PATH` to select another file and `--check-config` to validate without starting services. SIGHUP reloads the selected file; listener and TLS changes require a restart. For a complete demo with mock services, use `docker compose up --build`; it uses `demo/config.yaml`. See the [README quick start](README.md#quick-start-docker-demo) for endpoints and credentials.
 
 ## Find the relevant code
 

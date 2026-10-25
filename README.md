@@ -33,7 +33,7 @@ The core HTTP features are implemented and tested. The project still has correct
 - Configurable retries with bounded request body buffering and explicit write-method safeguards.
 - HTTPS using certificate files or automatic Let's Encrypt certificates.
 - JSON backend status at `/healthz` and Prometheus metrics at `/metrics`.
-- Signal-driven HTTP shutdown on `SIGINT` or `SIGTERM`, with a shared 10-second server drain deadline. Active health probes can extend total exit time.
+- Signal-driven HTTP shutdown on `SIGINT` or `SIGTERM`, with a shared 10-second server drain deadline. Health probes are canceled during shutdown.
 - GitHub Actions build, vet, race-test, Compose-validation, and Docker-build jobs.
 
 ## Current limitations
@@ -41,15 +41,14 @@ The core HTTP features are implemented and tested. The project still has correct
 Review scope: source and local validation at commit `2565da1` on **2026-10-25**. These are current implementation limits, not claims that every deployment will encounter them.
 
 - **HTTP correctness:** headers named by `Connection` are not removed, `Trailer` handling is incomplete, and `X-Forwarded-Proto` is not sanitized or generated. Do not treat that header as an authenticated scheme signal.
-- **URL forwarding:** use backend origin URLs such as `http://backend:9001`. Backend base paths and queries are ignored, and encoded path separators such as `%2F` are decoded during forwarding.
+- **URL forwarding:** use backend origin URLs such as `http://backend:9001`. Backend base paths and queries are rejected by configuration validation, and encoded path separators such as `%2F` are decoded during forwarding.
 - **Response failures:** upstream body-copy errors are ignored after response headers are sent; a truncated response can still count as a backend success.
-- **Configuration:** unknown YAML keys, invalid plain-HTTP port ranges, relative paths/URLs, and duplicate routes are not fully rejected. Review settings carefully; there is no `--check-config` command.
 - **Resource controls:** listener read/header/write/idle timeouts are unset. A positive route `timeout` limits each upstream attempt, but does not cover initial retry-body buffering or impose a total request deadline. Upload size, concurrent buffers, and tracked limiter identities have no configured hard cap.
-- **Recovery and lifecycle:** half-open breakers admit multiple requests, late successes can close an open breaker, listener failures currently exit with status zero, and shutdown does not explicitly stop all limiter/transport resources.
+- **Recovery and lifecycle:** half-open breakers admit multiple requests, late successes can close an open breaker, listener failures currently exit with status zero, and shutdown of stalled upstream requests still depends on request cancellation.
 - **Operations:** `/healthz` and `/metrics` share the application listener without authentication and bypass rate limits. `/healthz` reports aggregate backend condition, not separate liveness/readiness. Rate limits and resilience state are local to each process. Sticky cookies have limited security/scoping controls.
 - **Protocols and deployment:** WebSocket/CONNECT tunnels, reliable SSE flushing, response trailers, and validated gRPC support are not implemented. Live ACME issuance, the running Compose stack, load behavior, and release deployment were not verified in this review.
 
-Configuration reload, dynamic service discovery, authentication middleware, distributed rate limits, and release publishing are also outside the current implementation. Report reproducible bugs using the [contribution guide](CONTRIBUTING.md#report-a-bug-or-propose-a-feature).
+Dynamic service discovery, authentication middleware, distributed rate limits, and release publishing are also outside the current implementation. Report reproducible bugs using the [contribution guide](CONTRIBUTING.md#report-a-bug-or-propose-a-feature).
 
 ## Project structure
 
@@ -72,7 +71,7 @@ prometheus/, grafana/    Scraping and dashboard provisioning
 .github/                CI and dependency-update configuration
 ```
 
-Tests live beside their implementation, with application integration and TLS setup tests at the root. Configuration is loaded once at startup; runtime state is held in memory. Normal requests pass through global limiting, route matching, route limiting, backend selection, and forwarding. Management endpoints are registered separately.
+Tests live beside their implementation, with application integration and TLS setup tests at the root. Configuration is loaded at startup and can be reloaded with SIGHUP; runtime state is held in memory. Normal requests pass through global limiting, route matching, route limiting, backend selection, and forwarding. Management endpoints are registered separately.
 
 ## Quick start: Docker demo
 
@@ -151,6 +150,26 @@ go build .
 The application always reads `config.yaml` from its **current working directory**. There is no command-line config-path flag. Restart the process after changing configuration. Press `Ctrl+C` to shut down.
 
 ## Configuration
+
+Select a file explicitly, or omit `--config` to use `config.yaml` in the current working directory:
+
+```bash
+go run . --config ./demo/config.yaml --check-config
+go build -o reverse_proxy .
+./reverse_proxy --config ./config.yaml
+# After editing the selected file, reload the running binary:
+kill -HUP <proxy-pid>
+```
+
+`--check-config` exits successfully only when configuration validation succeeds. It also reads and validates manual TLS certificate/key pairs. It starts no listeners, health probes, limiter workers, ACME requests, or backend requests. Relative file paths (including TLS files) remain relative to the process working directory.
+
+The YAML schema rejects unknown fields at every level, duplicate mapping keys, and multiple documents. Anchors and merge keys are supported within schema fields; arbitrary top-level anchor containers such as `defaults:` are rejected. Listener ports must be 1–65535; omitted/zero TLS ports retain the documented defaults. Route, strip-prefix, and health-check paths must start with one slash and cannot contain queries, fragments, percent escapes, whitespace, controls, backslashes, repeated slashes, or dot segments. Route paths must be unique (overlapping prefixes remain valid).
+
+Backends must be absolute HTTP(S) origin URLs with valid hostnames or bracketed IPv6 addresses and valid optional ports. Credentials, base paths other than `/`, queries, and fragments are rejected because forwarding does not support them.
+
+SIGHUP rereads the selected file and atomically replaces routes, backends, retry policies, limits, trusted proxies, and health-check settings. Requests already running finish with their previous configuration. Invalid files leave the active configuration intact and log an error. Changes to `port` or any `tls` setting are rejected on reload and require a restart. Reload is signal-driven, not an automatic file watcher; use the binary's PID rather than the `go run` parent PID.
+
+Each successful reload starts fresh health, circuit-breaker, load-balancer, rate-limiter, and metrics state. Old health probes are canceled immediately; old limiter workers and idle connections are released after their in-flight requests finish. Management endpoints switch together with the proxy configuration.
 
 The following is a complete, smaller alternative to the checked-in configuration. Replace the backend URLs with your services:
 
@@ -356,7 +375,7 @@ Inside a container, `localhost` refers to that container. The Compose setup uses
 
 ## Troubleshooting
 
-- **Cannot read `config.yaml`:** run from the repository root, or place the configuration in the binary's working directory.
+- **Cannot read `config.yaml`:** pass `--config /path/to/config.yaml`, or place the configuration in the binary's working directory.
 - **Port already in use:** stop the conflicting process, change `port` locally, or change the published host port in Compose. Local and Docker workflows both use `8080` by default.
 - **`502` response:** check that the URL matches a route and that upstream URLs are reachable. Inspect proxy logs for forwarding errors.
 - **`503` response:** inspect `/healthz` for unhealthy backends or open circuits. Verify upstream `/health` responses and the configured probe path.
