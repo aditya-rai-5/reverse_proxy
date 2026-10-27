@@ -192,3 +192,32 @@ func writeTestCertificate(t *testing.T) (string, string) {
 	}
 	return certFile, keyFile
 }
+
+func TestManualTLSHandshake(t *testing.T) {
+	certFile, keyFile := writeTestCertificate(t)
+	servers, err := newServers(&config.Config{Port: 8080, TLS: &config.TLS{
+		CertFile: certFile, KeyFile: keyFile, HTTPPort: 8081, HTTPSPort: 8443,
+	}}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			t.Error("request was not TLS")
+		}
+		w.Write([]byte("secure"))
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(servers.app.Handler)
+	server.TLS = servers.app.TLSConfig.Clone()
+	server.StartTLS()
+	defer server.Close()
+	client := server.Client()
+	client.Transport.(*http.Transport).TLSClientConfig.ServerName = "proxy.example.com"
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 || resp.TLS.Version < tls.VersionTLS12 {
+		t.Fatalf("unexpected TLS response: %+v", resp)
+	}
+}
