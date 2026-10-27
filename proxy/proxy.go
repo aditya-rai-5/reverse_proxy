@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"time"
@@ -44,6 +43,11 @@ type Handler struct {
 // request. backend is empty when no backend was selected.
 type RequestObserver interface {
 	ObserveRequest(route, backend string, statusCode int, duration time.Duration)
+}
+
+// AttemptObserver receives one observation per explicit backend attempt, including retries.
+type AttemptObserver interface {
+	ObserveAttempt(route, backend string, statusCode int, outcome string, duration time.Duration)
 }
 
 type rateLimitRejectionObserver interface {
@@ -132,17 +136,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	entry, err := h.router.Match(r.URL.Path)
 	if err != nil {
-		log.Printf("[PROXY] no route for %s: %v", r.URL.Path, err)
 		http.Error(w, "502 Bad Gateway: no upstream route", http.StatusBadGateway)
 		return
 	}
 	metricRoute = entry.Path
+	if completion := completionFrom(r); completion != nil {
+		completion.route = entry.Path
+	}
 
 	if entry.RateLimiter != nil && !entry.RateLimiter.AllowRequest(r) {
 		if observer, ok := h.observer.(rateLimitRejectionObserver); ok {
 			observer.ObserveRateLimitRejection(entry.Path)
 		}
-		log.Printf("[PROXY] rate limit exceeded for route %s from %s", entry.Path, r.RemoteAddr)
 		w.Header().Set("Retry-After", entry.RateLimiter.RetryAfterHeader())
 		http.Error(w, "429 Too Many Requests: rate limit exceeded", http.StatusTooManyRequests)
 		return
@@ -168,7 +173,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			_ = r.Body.Close()
-			log.Printf("[PROXY] error reading request body: %v", err)
 			http.Error(w, "400 Bad Request: failed to read request body", http.StatusBadRequest)
 			return
 		}
@@ -186,7 +190,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	excluded := make(map[string]bool)
-	var lastErr error
 	var lastStatusCode int
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -197,19 +200,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			if errors.Is(err, loadbalancer.ErrNoHealthyBackend) {
 				if attempt == 0 {
-					log.Printf("[PROXY] all backends unhealthy for %s", r.URL.Path)
 					http.Error(w, "503 Service Unavailable: all backends are unhealthy", http.StatusServiceUnavailable)
 					return
 				}
 				break
 			}
-			log.Printf("[PROXY] load balancer error for %s: %v", r.URL.Path, err)
 			http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
 			return
 		}
 
 		target := result.URL
 		metricBackend = target.String()
+		if completion := completionFrom(r); completion != nil {
+			completion.backend = metricBackend
+			completion.attempts++
+		}
 		excluded[target.String()] = true
 
 		success, statusCode, err := h.forward(w, r, entry, result, bodyBytes, bufferedBody, maxAttempts > 1)
@@ -219,21 +224,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if success {
-			entry.LB.RecordSuccess(target)
+			if err == nil {
+				entry.LB.RecordSuccess(target)
+			}
 			return
 		}
 
 		entry.LB.RecordFailure(target)
-		lastErr = err
 		lastStatusCode = statusCode
-		log.Printf("[PROXY] attempt %d on %s failed (status=%d, err=%v)",
-			attempt+1, target.Host, statusCode, err)
 	}
 	if stopIfCanceled() {
 		return
 	}
 
-	log.Printf("[PROXY] all retry attempts failed for %s: lastErr=%v, lastStatus=%d", r.URL.Path, lastErr, lastStatusCode)
 	if lastStatusCode == http.StatusGatewayTimeout {
 		http.Error(w, "504 Gateway Timeout: all upstream backends timed out", http.StatusGatewayTimeout)
 	} else {
@@ -272,6 +275,20 @@ func (w *statusResponseWriter) statusCode() int {
 func (w *statusResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.Entry, result *loadbalancer.Result, bodyBytes []byte, bufferedBody, allowReplay bool) (bool, int, error) {
+	started := time.Now()
+	actualStatus := 0
+	outcome := "transport_error"
+	defer func() {
+		if r.Context().Err() != nil {
+			outcome = "canceled"
+		}
+		if observer, ok := h.observer.(AttemptObserver); ok {
+			observer.ObserveAttempt(entry.Path, result.URL.String(), actualStatus, outcome, time.Since(started))
+		}
+		if completion := completionFrom(r); completion != nil {
+			completion.outcome = outcome
+		}
+	}()
 	if result.Done != nil {
 		defer result.Done()
 	}
@@ -320,16 +337,17 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 		outReq.Header.Set("X-Forwarded-For", ip)
 	}
 
-	log.Printf("[PROXY] %s %s → %s%s", outReq.Method, r.URL.Path, target.Host, outReq.URL.Path)
-
 	resp, err := h.transport.RoundTrip(outReq)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
+			outcome = "timeout"
 			return false, http.StatusGatewayTimeout, err
 		}
 		return false, http.StatusBadGateway, err
 	}
 
+	actualStatus = resp.StatusCode
+	outcome = "upstream_error"
 	if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusGatewayTimeout {
 		_ = resp.Body.Close()
 		return false, resp.StatusCode, fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
@@ -345,9 +363,15 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	copyHeader(w.Header(), resp.Header)
 
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-
-	return true, resp.StatusCode, nil
+	_, err = io.Copy(w, resp.Body)
+	outcome = "success"
+	if err != nil {
+		outcome = "response_error"
+	} else if resp.StatusCode >= 500 {
+		outcome = "upstream_error"
+	}
+	// Headers have been sent: never retry or append an error after a copy failure.
+	return true, resp.StatusCode, err
 }
 
 func removeHopByHopHeaders(h http.Header) {
