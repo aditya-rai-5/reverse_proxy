@@ -14,12 +14,13 @@ import (
 )
 
 type generation struct {
-	cfg      *config.Config
-	handler  http.Handler
-	cancel   context.CancelFunc
-	probes   sync.WaitGroup
-	requests sync.WaitGroup
-	cleanup  func()
+	cfg        *config.Config
+	handler    http.Handler
+	management http.Handler
+	cancel     context.CancelFunc
+	probes     sync.WaitGroup
+	requests   sync.WaitGroup
+	cleanup    func()
 }
 
 func newGeneration(ctx context.Context, cfg *config.Config) (*generation, error) {
@@ -32,9 +33,9 @@ func newGeneration(ctx context.Context, cfg *config.Config) (*generation, error)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.Handler())
 	mux.HandleFunc("/healthz", makeHealthzHandler(r, cfg))
-	mux.Handle("/", handler)
+	mux.HandleFunc("/readyz", readinessHandler(r))
 	ctx, cancel := context.WithCancel(ctx)
-	g := &generation{cfg: cfg, handler: mux, cancel: cancel, cleanup: func() {
+	g := &generation{cfg: cfg, handler: handler, management: mux, cancel: cancel, cleanup: func() {
 		cleanup()
 		for _, entry := range r.Entries() {
 			entry.RateLimiter.Stop()
@@ -63,6 +64,22 @@ func newRuntime(ctx context.Context, cfg *config.Config) (*runtimeHandler, error
 }
 
 func (r *runtimeHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	r.serveGeneration(w, req, false)
+}
+
+func (r *runtimeHandler) serveManagement(w http.ResponseWriter, req *http.Request) {
+	if req.URL.Path == "/livez" {
+		w.Write([]byte("alive\n"))
+		return
+	}
+	if req.URL.Path == "/readyz" && r.ctx.Err() != nil {
+		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	r.serveGeneration(w, req, true)
+}
+
+func (r *runtimeHandler) serveGeneration(w http.ResponseWriter, req *http.Request, management bool) {
 	r.mu.Lock()
 	g := r.current
 	if g != nil {
@@ -74,7 +91,11 @@ func (r *runtimeHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	defer g.requests.Done()
-	g.handler.ServeHTTP(w, req)
+	if management {
+		g.management.ServeHTTP(w, req)
+	} else {
+		g.handler.ServeHTTP(w, req)
+	}
 }
 
 // reload and close are serialized by the main signal loop.
@@ -89,8 +110,8 @@ func (r *runtimeHandler) reload(path string) error {
 	if old == nil {
 		return fmt.Errorf("runtime is closed")
 	}
-	if cfg.Port != old.cfg.Port || !reflect.DeepEqual(cfg.TLS, old.cfg.TLS) {
-		return fmt.Errorf("listener and TLS changes require a restart")
+	if cfg.Port != old.cfg.Port || !reflect.DeepEqual(cfg.TLS, old.cfg.TLS) || !reflect.DeepEqual(cfg.Management, old.cfg.Management) {
+		return fmt.Errorf("listener, management, and TLS changes require a restart")
 	}
 	next, err := newGeneration(r.ctx, cfg)
 	if err != nil {
