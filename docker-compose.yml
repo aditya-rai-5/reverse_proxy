@@ -5,6 +5,7 @@ services:
     image: reverse-proxy-demo:local
     ports:
       - "8080:8080"
+      - "127.0.0.1:9091:9091"
     volumes:
       - ./demo/config.yaml:/app/config.yaml:ro
     depends_on:
@@ -12,7 +13,7 @@ services:
       - backend2
       - backend3
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/livez"]
       interval: 5s
       timeout: 2s
       retries: 12

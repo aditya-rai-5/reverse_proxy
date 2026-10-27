@@ -47,3 +47,5 @@ jobs:
         run: docker compose config --quiet
       - name: Build proxy image
         run: docker build --tag reverse-proxy-ci .
+      - name: Verify container runtime
+        run: sh scripts/container-smoke.sh reverse-proxy-ci

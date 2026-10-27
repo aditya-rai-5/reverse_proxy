@@ -7,6 +7,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/reverse-proxy .
 
 FROM alpine:3.24
+RUN apk add --no-cache ca-certificates
 RUN addgroup -S proxy && adduser -S -G proxy proxy
 WORKDIR /app
 COPY --from=build /out/reverse-proxy /usr/local/bin/reverse-proxy
