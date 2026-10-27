@@ -4,7 +4,7 @@ An HTTP reverse proxy written in Go, with path-based routing, five load balancin
 
 Start with the Docker demo for mock backends and monitoring, or run the proxy locally against your own upstream services.
 
-The core HTTP features are implemented and tested. The project still has correctness and operational gaps described under [Current limitations](#current-limitations); it does not yet have a production capacity or reliability baseline.
+The core HTTP features are implemented and tested. The project still has correctness and operational gaps described under [Current limitations](#current-limitations); the local performance baseline is not a production capacity or reliability guarantee.
 
 ## Contents
 
@@ -32,21 +32,22 @@ The core HTTP features are implemented and tested. The project still has correct
 - Shared client-IP resolution for rate limiting and IP hashing, with explicit trusted-proxy CIDRs.
 - Configurable retries with bounded request body buffering and explicit write-method safeguards.
 - HTTPS using certificate files or automatic Let's Encrypt certificates.
-- JSON backend status at `/healthz` and Prometheus metrics at `/metrics`.
+- Separate liveness (`/livez`) and readiness (`/readyz`), detailed backend status (`/healthz`), and Prometheus metrics on an IP-restricted management listener.
+- JSON application completion logs and metrics for individual backend attempts.
 - Signal-driven HTTP shutdown on `SIGINT` or `SIGTERM`, with a shared 10-second server drain deadline. Health probes are canceled during shutdown.
-- GitHub Actions build, vet, race-test, Compose-validation, and Docker-build jobs.
+- GitHub Actions build, vet, race-test, Compose-validation, Docker-build, and container runtime smoke checks.
 
 ## Current limitations
 
-Review scope: source and local validation at commit `2565da1` on **2026-10-25**. These are current implementation limits, not claims that every deployment will encounter them.
+Review scope: source and local validation on **2026-10-25**. These are current implementation limits, not claims that every deployment will encounter them.
 
 - **HTTP correctness:** headers named by `Connection` are not removed, `Trailer` handling is incomplete, and `X-Forwarded-Proto` is not sanitized or generated. Do not treat that header as an authenticated scheme signal.
 - **URL forwarding:** use backend origin URLs such as `http://backend:9001`. Backend base paths and queries are rejected by configuration validation, and encoded path separators such as `%2F` are decoded during forwarding.
-- **Response failures:** upstream body-copy errors are ignored after response headers are sent; a truncated response can still count as a backend success.
-- **Resource controls:** listener read/header/write/idle timeouts are unset. A positive route `timeout` limits each upstream attempt, but does not cover initial retry-body buffering or impose a total request deadline. Upload size, concurrent buffers, and tracked limiter identities have no configured hard cap.
-- **Recovery and lifecycle:** half-open breakers admit multiple requests, late successes can close an open breaker, listener failures currently exit with status zero, and shutdown of stalled upstream requests still depends on request cancellation.
-- **Operations:** `/healthz` and `/metrics` share the application listener without authentication and bypass rate limits. `/healthz` reports aggregate backend condition, not separate liveness/readiness. Rate limits and resilience state are local to each process. Sticky cookies have limited security/scoping controls.
-- **Protocols and deployment:** WebSocket/CONNECT tunnels, reliable SSE flushing, response trailers, and validated gRPC support are not implemented. Live ACME issuance, the running Compose stack, load behavior, and release deployment were not verified in this review.
+- **Response failures:** response-copy failures are observed but headers already sent cannot be replaced; the client may receive a truncated response. These failures do not reset the backend breaker as a success.
+- **Resource controls:** application and redirect listener read/header/write/idle timeouts are unset; the management listener has bounded header, write, and idle timeouts. A positive route `timeout` limits each upstream attempt, but does not cover initial retry-body buffering or impose a total request deadline. Upload size, concurrent buffers, and tracked limiter identities have no configured hard cap.
+- **Recovery and lifecycle:** half-open breakers admit multiple requests, late successes can close an open breaker, shutdown of stalled upstream requests still depends on request cancellation.
+- **Operations:** Management protection is a direct-peer IP allowlist, without user authentication or TLS. Use a private network and narrow CIDRs for remote monitoring. Rate limits and resilience state are local to each process. Sticky cookies have limited security/scoping controls.
+- **Protocols and deployment:** WebSocket/CONNECT tunnels, reliable SSE flushing, response trailers, and validated gRPC support are not implemented. Live ACME issuance, production load behavior, and release deployment are not covered by the local checks.
 
 Dynamic service discovery, authentication middleware, distributed rate limits, and release publishing are also outside the current implementation. Report reproducible bugs using the [contribution guide](CONTRIBUTING.md#report-a-bug-or-propose-a-feature).
 
@@ -56,6 +57,8 @@ Dynamic service discovery, authentication middleware, distributed rate limits, a
 main.go                 Startup, middleware, signals, and shutdown
 server.go               HTTP/HTTPS listeners and redirects
 health.go               Aggregate backend status endpoint
+management.go           Dedicated listener, access control, and readiness
+reload.go               Configuration generations and resource cleanup
 config/                 YAML settings, defaults, and validation
 router/                 Route matching, rewrites, and retry eligibility
 proxy/                  Forwarding, body replay, and request observations
@@ -91,8 +94,8 @@ Once the services start:
 curl -i http://localhost:8080/api/demo
 curl -i http://localhost:8080/limited/demo
 curl -i http://localhost:8080/breaker/demo
-curl -i http://localhost:8080/healthz
-curl http://localhost:8080/metrics
+curl -i http://127.0.0.1:9091/healthz
+curl http://127.0.0.1:9091/metrics
 ```
 
 - Proxy: [localhost:8080/api/demo](http://localhost:8080/api/demo).
@@ -113,7 +116,7 @@ Prometheus and Grafana data remain in named volumes. To also delete that demo da
 docker compose down -v
 ```
 
-The bundled Grafana credentials are for the local demo only. Compose publishes ports `8080`, `9090`, and `3000` on all host interfaces by default; restrict exposure when running on a shared host. The intentional breaker failures can also make the proxy container report unhealthy while `/api` still works.
+The bundled Grafana credentials are for the local demo only. Compose publishes ports `8080`, `9090`, and `3000` on all host interfaces by default; restrict exposure when running on a shared host. Management port `9091` is published only on host loopback. The container health check uses `/livez`, so an upstream failure does not restart a healthy proxy. The intentional `/breaker` failures can make `/readyz` return `503` while `/api` still works.
 
 ## Run locally
 
@@ -137,7 +140,7 @@ go mod download
 
    ```bash
    curl -i http://localhost:8080/api/users
-   curl -i http://localhost:8080/healthz
+   curl -i http://127.0.0.1:9091/healthz
    ```
 
 To build and run a binary instead:
@@ -167,9 +170,9 @@ The YAML schema rejects unknown fields at every level, duplicate mapping keys, a
 
 Backends must be absolute HTTP(S) origin URLs with valid hostnames or bracketed IPv6 addresses and valid optional ports. Credentials, base paths other than `/`, queries, and fragments are rejected because forwarding does not support them.
 
-SIGHUP rereads the selected file and atomically replaces routes, backends, retry policies, limits, trusted proxies, and health-check settings. Requests already running finish with their previous configuration. Invalid files leave the active configuration intact and log an error. Changes to `port` or any `tls` setting are rejected on reload and require a restart. Reload is signal-driven, not an automatic file watcher; use the binary's PID rather than the `go run` parent PID.
+SIGHUP rereads the selected file and atomically replaces routes, backends, retry policies, limits, trusted proxies, and health-check settings. Requests already running finish with their previous configuration. Invalid files leave the active configuration intact and log an error. Changes to `port`, `management`, or any `tls` setting are rejected on reload and require a restart. Reload is signal-driven, not an automatic file watcher; use the binary's PID rather than the `go run` parent PID.
 
-Each successful reload starts fresh health, circuit-breaker, load-balancer, rate-limiter, and metrics state. Old health probes are canceled immediately; old limiter workers and idle connections are released after their in-flight requests finish. Management endpoints switch together with the proxy configuration.
+Each successful reload starts fresh health, circuit-breaker, load-balancer, rate-limiter, and metrics state. Old health probes are canceled immediately; old limiter workers and idle connections are released after their in-flight requests finish. Management endpoint data switches together with the proxy configuration. Readiness waits for successful probes in the new generation.
 
 The following is a complete, smaller alternative to the checked-in configuration. Replace the backend URLs with your services:
 
@@ -207,7 +210,7 @@ With this configuration, `/api/users` reaches an upstream as `/users`. An unrela
 
 ### Routing and load balancing
 
-Give each route a unique absolute path. Routes are evaluated by longest matching path, independently of their order in YAML. `/api/` matches descendants but not the bare `/api`; `/healthz` and `/metrics` are reserved by the application mux. Prefix stripping runs before regex rewriting. For example, this optional route field rewrites `/legacy/users` to `/v2/users`:
+Give each route a unique absolute path. Routes are evaluated by longest matching path, independently of their order in YAML. `/api/` matches descendants but not the bare `/api`; Management paths are served only by the management listener; they are ordinary route paths on the application listener. Prefix stripping runs before regex rewriting. For example, this optional route field rewrites `/legacy/users` to `/v2/users`:
 
 ```yaml
 rewrite:
@@ -228,13 +231,14 @@ Unhealthy backends and open circuits are skipped during selection.
 ### Defaults and limits
 
 - `port` is required, including when TLS is configured. Without TLS, it is the HTTP listener port.
+- `management.address` defaults to `127.0.0.1:9091`; it must be a literal IP and a separate port. `management.allowed_cidrs` defaults to loopback ranges for loopback binds; non-loopback binds require an explicit allowlist.
 - `max_request_body_bytes` defaults to `10485760` (10 MiB) when omitted or zero. It limits retry buffering, **not upload size**: larger bodies stream to one backend without retries.
 - `health_check` defaults to `/health`, a `10s` interval, and a `5s` timeout. Probes use the backend's scheme and host plus this path, without route rewriting. Non-`2xx` responses and connection failures mark a backend unhealthy.
 - `timeout` is a per-attempt upstream timeout, such as `3s`. Omitted or zero adds no route-specific deadline.
 - `circuit_breaker` defaults to a failure threshold of `5` and a `10s` cooldown, even when the section is omitted. Successful health probes update backend health but do not clear circuit-breaker failures, close the circuit, or bypass cooldown. After cooldown, a healthy backend becomes eligible for application requests in the half-open state. A successful application request closes the circuit and clears its failures; a failed application request reopens it.
 - `rate_limit.requests_per_minute` enables per-IP limiting when positive. Omitted or zero disables that limiter. For an enabled limiter, omitted or zero `burst` defaults to `1`.
 
-A route may also define its own `rate_limit` section. Global and route limits both apply; a route limit does not replace the global limit. `/healthz` and `/metrics` bypass these proxy request limiters.
+A route may also define its own `rate_limit` section. Global and route limits both apply; a route limit does not replace the global limit. Management endpoints use their separate listener and IP allowlist instead of proxy request limiters.
 
 ### Client IP and trusted proxies
 
@@ -343,6 +347,21 @@ Keep private keys and certificate caches out of commits. The bundled Docker demo
 
 ## Health and monitoring
 
+**Upgrade:** move existing health checks and scrapers from the application port to management port `9091`. Use `/livez` for process/container health and `/readyz` for traffic admission. TLS on the application listener does not change the management listener, which stays HTTP.
+
+```yaml
+management:
+  address: "127.0.0.1:9091"
+  allowed_cidrs: ["127.0.0.0/8", "::1/128"]
+```
+
+Every management request is checked against its direct TCP peer; `X-Forwarded-For` and other forwarded headers cannot grant access. Denied peers receive `403`. For remote monitoring, bind a private IP and explicitly allow only the monitoring/probe subnet. The demo allows private IPv4 Docker peers and loopback, and publishes the management port only on `127.0.0.1`. It is network access control, not bearer-token authentication; do not place an untrusted forwarding proxy inside an allowed subnet.
+
+- `/livez` returns `200` while the process can respond, independently of upstream health. Restarting the proxy cannot repair a down backend.
+- `/readyz` returns `200` only after every configured route has at least one successfully probed, healthy backend whose breaker is not open. A failed replica does not make a route unready if another can serve it. Half-open breakers are eligible to receive recovery traffic. It returns `503` before probes succeed, while a route has no usable backend, and during shutdown while the listener remains open.
+- `/healthz` remains the detailed diagnostic below. Its stricter aggregate status is useful for investigation, not process restart decisions.
+
+
 `GET /healthz` returns JSON with overall status, route algorithms, retry budgets, retry methods, rate limits, and backend details. Those details include health and circuit state, with weights, active connections, and failure counters where applicable.
 
 It returns `200` when all backends are probe-healthy and no circuit is open, or `503` with status `degraded` otherwise. A degraded result does not necessarily mean every route is unavailable. Backends start healthy before their first probe, and half-open circuits do not by themselves make the response degraded. The handlers do not restrict requests to GET.
@@ -356,11 +375,13 @@ Metrics use configured route/backend labels rather than individual request paths
 - `http_requests_total{route,backend,status_code}` counts completed proxy-handler requests.
 - `http_request_duration_seconds` exposes a latency histogram in seconds with the same labels.
 - `rate_limit_rejections_total{route}` includes route rejections and `route="global"` for global rejections.
+- `backend_attempts_total{route,backend,status_code,outcome}` counts each explicit proxy attempt, including retries. A status of `0` means no upstream response headers arrived.
+- `backend_attempt_duration_seconds_sum` and `_count` record attempt duration, including response copying. Divide their rates for mean attempt duration. Outcomes are `success`, `upstream_error`, `transport_error`, `timeout`, `canceled`, and `response_error`. Internal transport replays are not separate attempts.
 - `backend_healthy_gauge{route,backend}` reports probe health as `0` or `1`.
 - `circuit_breaker_state{route,backend,state}` reports one active state per backend.
 - `circuit_breaker_trips_total{route,backend}` counts transitions into the open state.
 
-Global rate-limit rejections bypass the request counter/histogram; route rejections enter both request and rejection metrics. Retries produce one final request observation labeled with the last backend, not one observation per attempt. Management requests are excluded. Counters reset when the process restarts.
+Global rate-limit rejections bypass the request counter/histogram; route rejections enter both request and rejection metrics. Retries produce one final request observation labeled with the last backend, plus separate attempt observations. Management requests are excluded. Counters reset on restart or successful configuration reload.
 
 For a Prometheus instance running directly on the same host:
 
@@ -368,10 +389,31 @@ For a Prometheus instance running directly on the same host:
 scrape_configs:
   - job_name: reverse-proxy
     static_configs:
-      - targets: ["localhost:8080"]
+      - targets: ["127.0.0.1:9091"]
 ```
 
-Inside a container, `localhost` refers to that container. The Compose setup uses `proxy:8080`. When TLS is enabled, scrape the HTTPS listener with `scheme: https` and the appropriate certificate trust settings.
+Inside a container, `localhost` refers to that container. The Compose setup uses `proxy:9091` over its private Docker network. Scrape the management HTTP listener even when application TLS is enabled.
+
+### Completion logs
+
+Each completed application request writes one JSON record to stdout, outside global rate limiting, including rejected requests. Fields are `method`, configured `route`, last `backend`, response `status`, bytes written, `duration_ms`, `attempts`, and final attempt `outcome`. A request rejected before forwarding has `attempts: 0` and `outcome: "no_attempt"`; global rejections have route `unmatched` because routing has not run. Raw paths, query strings, headers, and bodies are omitted. Management requests do not produce application completion logs. Startup, probe, and shutdown diagnostics remain on stderr.
+
+```json
+{"level":"INFO","msg":"request_completed","method":"GET","route":"/api","backend":"http://backend2:9002","status":200,"bytes":21,"duration_ms":1.7,"attempts":2,"outcome":"success"}
+```
+
+The final status describes headers sent to the client; `response_error` or `canceled` can accompany a `200` if the response failed after headers were committed. Completion logs are synchronous; a slow stdout consumer can reduce throughput.
+
+### Performance and container checks
+
+See [PERFORMANCE.md](PERFORMANCE.md) for the repeatable local HTTP benchmark and its measured scope.
+
+```bash
+docker build -t reverse-proxy-demo:local .
+sh scripts/container-smoke.sh reverse-proxy-demo:local
+```
+
+The smoke test starts a temporary, portless Docker network with a backend and the production proxy image. It checks configuration, non-root execution, forwarding, management isolation, metrics, JSON logs, liveness during a backend outage, readiness recovery, and clean SIGTERM exit. It cleans up its own containers and network. CI runs the same script after building the image. It does not test public ACME issuance or the Grafana UI.
 
 ## Troubleshooting
 

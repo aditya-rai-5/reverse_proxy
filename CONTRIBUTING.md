@@ -38,11 +38,13 @@ go build .
 go test ./...
 ```
 
-For local requests, start upstream services and edit root `config.yaml`, then run `go run .`. The application defaults to `config.yaml` in its current working directory; use `--config PATH` to select another file and `--check-config` to validate without starting services. SIGHUP reloads the selected file; listener and TLS changes require a restart. For a complete demo with mock services, use `docker compose up --build`; it uses `demo/config.yaml`. See the [README quick start](README.md#quick-start-docker-demo) for endpoints and credentials.
+For local requests, start upstream services and edit root `config.yaml`, then run `go run .`. The application defaults to `config.yaml` in its current working directory; use `--config PATH` to select another file and `--check-config` to validate without starting services. SIGHUP reloads the selected file; listener, management access, and TLS changes require a restart. For a complete demo with mock services, use `docker compose up --build`; it uses `demo/config.yaml`. See the [README quick start](README.md#quick-start-docker-demo) for endpoints and credentials.
 
 ## Find the relevant code
 
-- `main.go`: startup, listeners, middleware, health/metrics endpoints, and graceful shutdown.
+- `main.go`: startup, middleware, signals, and graceful shutdown.
+- `server.go`, `management.go`: application/TLS listeners and protected management endpoints.
+- `reload.go`: atomic configuration reload and generation cleanup.
 - `config/`: YAML loading, validation, and defaults.
 - `router/`: route matching, prefix stripping, rewriting, and retry eligibility.
 - `proxy/`: upstream forwarding, body buffering, retries, cancellation, and timeouts.
@@ -114,7 +116,7 @@ docker compose config --quiet
 docker compose up --build
 ```
 
-Check the relevant routes, `/healthz`, `/metrics`, and dashboard panels, then stop with `docker compose down`. A successful Compose configuration check or image build does not verify runtime behavior. Include screenshots when changing dashboards.
+Check the relevant routes, management `/livez`, `/readyz`, `/healthz`, `/metrics`, and dashboard panels, then stop with `docker compose down`. Run `sh scripts/container-smoke.sh reverse-proxy-demo:local` after building that image for repeatable container checks. A successful Compose configuration check or image build alone does not verify runtime behavior. Include screenshots when changing dashboards.
 
 For documentation changes, check that commands match the implementation, configuration examples load successfully, and relative links and heading anchors resolve in rendered Markdown. Documentation-only changes do not normally require the full Go test suite.
 
