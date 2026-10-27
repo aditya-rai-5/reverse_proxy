@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -46,7 +47,10 @@ func buildManagedHandler(cfg *config.Config, r *router.Router, observers ...prox
 		handler = rl.Middleware(handler, onRejected)
 		cleanup = func() { rl.Stop(); proxyHandler.CloseIdleConnections() }
 	}
-	return handler, cleanup
+	// Retain ServeMux path canonicalization while keeping management routes separate.
+	mux := http.NewServeMux()
+	mux.Handle("/", handler)
+	return proxy.CompletionLogging(mux, slog.New(slog.NewJSONHandler(os.Stdout, nil))), cleanup
 }
 
 func main() {
@@ -96,7 +100,9 @@ func run(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	for _, srv := range servers.all() {
+	allServers := append(servers.all(), newManagementServer(cfg.Management, http.HandlerFunc(runtime.serveManagement)))
+	serverErrors := make(chan error, len(allServers))
+	for _, srv := range allServers {
 		protocol := "HTTP"
 		if srv.TLSConfig != nil {
 			protocol = "HTTPS"
@@ -105,6 +111,7 @@ func run(args []string, output io.Writer) error {
 		go func(srv *http.Server) {
 			if err := serve(srv); err != nil && err != http.ErrServerClosed {
 				log.Printf("server error on %s: %v", srv.Addr, err)
+				serverErrors <- fmt.Errorf("listener %s: %w", srv.Addr, err)
 				cancel()
 			}
 		}(srv)
@@ -129,12 +136,17 @@ running:
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
-	for _, srv := range servers.all() {
+	for _, srv := range allServers {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("graceful shutdown error for %s: %v", srv.Addr, err)
 			_ = srv.Close()
 		}
 	}
 
-	return nil
+	select {
+	case err := <-serverErrors:
+		return err
+	default:
+		return nil
+	}
 }
