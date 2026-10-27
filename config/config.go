@@ -198,6 +198,7 @@ func (hc *HealthCheck) defaults() {
 }
 
 type Config struct {
+	Management          Management  `yaml:"management"`
 	TrustedProxies      []string    `yaml:"trusted_proxies"`
 	Port                int         `yaml:"port"`
 	MaxRequestBodyBytes int64       `yaml:"max_request_body_bytes"`
@@ -274,6 +275,9 @@ func validate(cfg *Config) error {
 		} else if cfg.TLS.CertFile == "" || cfg.TLS.KeyFile == "" {
 			return fmt.Errorf("tls.cert_file and tls.key_file are both required unless auto_cert is enabled")
 		}
+	}
+	if err := cfg.Management.validate(cfg); err != nil {
+		return err
 	}
 	if cfg.RateLimit != nil {
 		if cfg.RateLimit.RequestsPerMinute < 0 {
