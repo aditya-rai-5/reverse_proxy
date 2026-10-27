@@ -24,6 +24,7 @@ var ErrNoHealthyBackend = errors.New("no healthy backends available")
 type backend struct {
 	url               *url.URL
 	healthy           atomic.Bool
+	probed            atomic.Bool
 	weight            int
 	currentWeight     int64
 	activeConnections atomic.Int64
@@ -365,6 +366,17 @@ func (lb *LoadBalancer) ConsecutiveFailures(idx int) int {
 // Note that this method does not reset the circuit breaker.
 func (lb *LoadBalancer) MarkHealthy(idx int, healthy bool) {
 	lb.backends[idx].healthy.Store(healthy)
+	lb.backends[idx].probed.Store(true)
+}
+
+// Ready reports whether this route has a successfully probed, usable backend.
+func (lb *LoadBalancer) Ready() bool {
+	for _, be := range lb.backends {
+		if be.probed.Load() && be.healthy.Load() && be.cb.State() != circuitbreaker.StateOpen {
+			return true
+		}
+	}
+	return false
 }
 
 // IsHealthy reports the current health state of the backend at index idx.
