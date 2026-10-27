@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -99,7 +100,7 @@ func TestReloadAtomicAndRollback(t *testing.T) {
 	if got := <-done; got != "old" {
 		t.Fatalf("in-flight response: %q", got)
 	}
-	for _, invalid := range []string{"port: -1", fmt.Sprintf("port: 9090\nroutes: [{path: /, backends: [{url: %s}]}]", old.URL)} {
+	for _, invalid := range []string{"port: -1", fmt.Sprintf("port: 9090\nroutes: [{path: /, backends: [{url: %s}]}]", old.URL), fmt.Sprintf("port: 8080\nmanagement: {address: \"127.0.0.1:9092\"}\nroutes: [{path: /, backends: [{url: %s}]}]", old.URL)} {
 		if err := os.WriteFile(path, []byte(invalid), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -136,5 +137,28 @@ func onceRelease(ch chan struct{}) func() {
 		default:
 			close(ch)
 		}
+	}
+}
+
+func TestListenerFailureReturnsError(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	management, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	managementAddress := management.Addr().String()
+	management.Close()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := fmt.Sprintf("port: %d\nmanagement: {address: %q}\nroutes: [{path: /, backends: [{url: http://127.0.0.1:1}]}]", occupied.Addr().(*net.TCPAddr).Port, managementAddress)
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := run([]string{"--config", path}, &output); err == nil || !strings.Contains(err.Error(), "listener") {
+		t.Fatalf("expected listener failure, got %v", err)
 	}
 }
