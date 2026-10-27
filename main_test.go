@@ -69,3 +69,18 @@ func TestBuildHandlerRateLimiting(t *testing.T) {
 		t.Fatalf("Other IP: expected 200 OK, got %d", recOther.Code)
 	}
 }
+
+func TestApplicationPreservesPathCanonicalization(t *testing.T) {
+	cfg := &config.Config{Routes: []config.Route{{Path: "/", Backends: []config.Backend{{URL: "http://127.0.0.1:1"}}}}}
+	r, err := router.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, cleanup := buildManagedHandler(cfg, r)
+	defer cleanup()
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest("GET", "/a/../b", nil))
+	if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != "/b" {
+		t.Fatalf("lost path canonicalization: status=%d location=%q", w.Code, w.Header().Get("Location"))
+	}
+}
