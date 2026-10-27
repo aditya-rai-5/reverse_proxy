@@ -25,6 +25,15 @@ type histogram struct {
 	sum     float64
 }
 
+type attemptLabels struct {
+	route, backend, status, outcome string
+}
+
+type attemptMetric struct {
+	count   uint64
+	seconds float64
+}
+
 // Metrics contains proxy counters, latency histograms, and backend health.
 type Metrics struct {
 	router              *router.Router
@@ -32,6 +41,7 @@ type Metrics struct {
 	counts              map[requestLabels]uint64
 	latency             map[requestLabels]*histogram
 	rateLimitRejections map[string]uint64
+	attempts            map[attemptLabels]attemptMetric
 }
 
 func New(r *router.Router) *Metrics {
@@ -40,7 +50,20 @@ func New(r *router.Router) *Metrics {
 		counts:              make(map[requestLabels]uint64),
 		latency:             make(map[requestLabels]*histogram),
 		rateLimitRejections: make(map[string]uint64),
+		attempts:            make(map[attemptLabels]attemptMetric),
 	}
+}
+
+// ObserveAttempt records each backend attempt separately from the final request.
+// Status zero means no upstream response headers were received.
+func (m *Metrics) ObserveAttempt(route, backend string, status int, outcome string, duration time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := attemptLabels{route, backend, strconv.Itoa(status), outcome}
+	value := m.attempts[key]
+	value.count++
+	value.seconds += max(0, duration.Seconds())
+	m.attempts[key] = value
 }
 
 // ObserveRequest records one completed proxied request.
@@ -121,7 +144,40 @@ func (m *Metrics) exposition() string {
 	for route, count := range m.rateLimitRejections {
 		rejections[route] = count
 	}
+	attempts := make(map[attemptLabels]attemptMetric, len(m.attempts))
+	for key, value := range m.attempts {
+		attempts[key] = value
+	}
 	m.mu.Unlock()
+
+	fmt.Fprintln(&b, "# HELP backend_attempts_total Explicit backend attempts, including retries.")
+	fmt.Fprintln(&b, "# TYPE backend_attempts_total counter")
+	fmt.Fprintln(&b, "# HELP backend_attempt_duration_seconds Time in each backend attempt, including response copying.")
+	fmt.Fprintln(&b, "# TYPE backend_attempt_duration_seconds summary")
+	keys := make([]attemptLabels, 0, len(attempts))
+	for key := range attempts {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, c := keys[i], keys[j]
+		if a.route != c.route {
+			return a.route < c.route
+		}
+		if a.backend != c.backend {
+			return a.backend < c.backend
+		}
+		if a.status != c.status {
+			return a.status < c.status
+		}
+		return a.outcome < c.outcome
+	})
+	for _, key := range keys {
+		value := attempts[key]
+		labels := fmt.Sprintf(`{route="%s",backend="%s",status_code="%s",outcome="%s"}`, escape(key.route), escape(key.backend), escape(key.status), escape(key.outcome))
+		fmt.Fprintf(&b, "backend_attempts_total%s %d\n", labels, value.count)
+		fmt.Fprintf(&b, "backend_attempt_duration_seconds_count%s %d\n", labels, value.count)
+		fmt.Fprintf(&b, "backend_attempt_duration_seconds_sum%s %g\n", labels, value.seconds)
+	}
 
 	histKeys := make([]requestLabels, 0, len(histograms))
 	for k := range histograms {
