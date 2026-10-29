@@ -49,6 +49,16 @@ func TestConfigChecking(t *testing.T) {
 	if err := run([]string{"--config", path, "--check-config"}, &out); err == nil {
 		t.Fatal("accepted invalid config")
 	}
+	duplicate := fmt.Sprintf("port: 8080\nroutes: [{path: /, backends: [{url: %q}, {url: %q}]}]", backend.URL, backend.URL)
+	if err := os.WriteFile(path, []byte(duplicate), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"--config", path, "--check-config"}, &out); err == nil {
+		t.Fatal("accepted duplicate backends")
+	}
+	if calls.Load() != 0 {
+		t.Fatal("config checking contacted backend")
+	}
 }
 
 func TestReloadAtomicAndRollback(t *testing.T) {
@@ -100,7 +110,7 @@ func TestReloadAtomicAndRollback(t *testing.T) {
 	if got := <-done; got != "old" {
 		t.Fatalf("in-flight response: %q", got)
 	}
-	for _, invalid := range []string{"port: -1", fmt.Sprintf("port: 9090\nroutes: [{path: /, backends: [{url: %s}]}]", old.URL), fmt.Sprintf("port: 8080\nmanagement: {address: \"127.0.0.1:9092\"}\nroutes: [{path: /, backends: [{url: %s}]}]", old.URL)} {
+	for _, invalid := range []string{"port: -1", fmt.Sprintf("port: 9090\nroutes: [{path: /, backends: [{url: %s}]}]", old.URL), fmt.Sprintf("port: 8080\nmanagement: {address: \"127.0.0.1:9092\"}\nroutes: [{path: /, backends: [{url: %s}]}]", old.URL), fmt.Sprintf("port: 8080\nroutes: [{path: /, backends: [{url: %q}, {url: %q}]}]", old.URL, old.URL)} {
 		if err := os.WriteFile(path, []byte(invalid), 0600); err != nil {
 			t.Fatal(err)
 		}
