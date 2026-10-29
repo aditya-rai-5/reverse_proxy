@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aditya-rai-5/reverse_proxy/config"
@@ -22,7 +23,7 @@ var hopByHopHeaders = []string{
 	"Proxy-Authenticate",
 	"Proxy-Authorization",
 	"Te",
-	"Trailers",
+	"Trailer",
 	"Transfer-Encoding",
 	"Upgrade",
 }
@@ -309,6 +310,9 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	outReq.URL.Path = rewrittenPath
 	outReq.URL.RawPath = ""
 	outReq.RequestURI = ""
+	// Trailers are unsupported: drop the request trailer map as well as its
+	// declaration, so Transport cannot regenerate or forward trailers.
+	outReq.Trailer = nil
 
 	if bufferedBody {
 		outReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -329,6 +333,13 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	removeHopByHopHeaders(outReq.Header)
 
 	outReq.Header.Set("X-Forwarded-Host", r.Host)
+	// Trust only the connection into this proxy for the scheme. TrustedProxies
+	// authorizes client-IP resolution, not client-supplied scheme headers.
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	outReq.Header.Set("X-Forwarded-Proto", scheme)
 	// Replace client-supplied identity headers with the resolved address.
 	outReq.Header.Del("Forwarded")
 	outReq.Header.Del("X-Real-IP")
@@ -360,6 +371,8 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	}
 
 	removeHopByHopHeaders(resp.Header)
+	// Drop trailer declarations and never copy resp.Trailer to the client,
+	// including trailers discovered while reading the response body.
 	copyHeader(w.Header(), resp.Header)
 
 	w.WriteHeader(resp.StatusCode)
@@ -375,6 +388,15 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 }
 
 func removeHopByHopHeaders(h http.Header) {
+	// Read every Connection line before deleting Connection itself. Each token
+	// names a field that is local to this hop, regardless of its casing.
+	for _, value := range h.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if name := strings.TrimSpace(token); name != "" {
+				h.Del(name)
+			}
+		}
+	}
 	for _, header := range hopByHopHeaders {
 		h.Del(header)
 	}
