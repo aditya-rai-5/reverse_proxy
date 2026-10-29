@@ -332,11 +332,17 @@ func validate(cfg *Config) error {
 		}
 
 		hasCustomWeight := false
+		seenBackends := make(map[string]int, len(route.Backends))
 		for j := range route.Backends {
 			backend := &route.Backends[j]
 			if err := validateBackend(backend.URL); err != nil {
 				return fmt.Errorf("route[%d].backend[%d]: %w", i, j, err)
 			}
+			u, _ := url.Parse(backend.URL) // Already validated above.
+			if first, exists := seenBackends[u.String()]; exists {
+				return fmt.Errorf("route[%d].backend[%d]: duplicate backend URL %q (already configured at backend[%d]); use weight for weighted distribution", i, j, backend.URL, first)
+			}
+			seenBackends[u.String()] = j
 			if backend.Weight < 0 {
 				return fmt.Errorf("route[%d].backend[%d]: weight must be non-negative", i, j)
 			}

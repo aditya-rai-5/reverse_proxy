@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"net/http"
@@ -87,14 +88,20 @@ type LoadBalancer struct {
 
 // New creates a LoadBalancer from the given config backends and optional configuration options.
 // All backends start as healthy so traffic flows immediately on startup.
+// Duplicate parsed backend URLs are rejected.
 func New(backends []config.Backend, opts ...Option) (*LoadBalancer, error) {
 	bs := make([]*backend, 0, len(backends))
+	seen := make(map[string]int, len(backends))
 
-	for _, b := range backends {
+	for i, b := range backends {
 		u, err := url.Parse(b.URL)
 		if err != nil {
 			return nil, err
 		}
+		if first, exists := seen[u.String()]; exists {
+			return nil, fmt.Errorf("backend[%d]: duplicate backend URL %q (already configured at backend[%d]); use weight for weighted distribution", i, b.URL, first)
+		}
+		seen[u.String()] = i
 		w := b.Weight
 		if w <= 0 {
 			w = 1
