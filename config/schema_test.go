@@ -66,3 +66,30 @@ func TestValidationBoundaries(t *testing.T) {
 		t.Fatal("accepted duplicate routes")
 	}
 }
+
+func TestBackendUniqueness(t *testing.T) {
+	for _, tc := range []struct {
+		name, routes string
+		wantError    bool
+	}{
+		{"duplicate", "- path: /\n  backends: [{url: 'http://one.example'}, {url: 'http://one.example', weight: 2}]", true},
+		{"parsed duplicate", "- path: /\n  backends: [{url: 'HTTP://one.example'}, {url: 'http://one.example'}]", true},
+		{"distinct", "- path: /\n  backends: [{url: 'http://one.example', weight: 2}, {url: 'http://two.example'}]", false},
+		{"different routes", "- path: /a\n  backends: [{url: 'http://one.example'}]\n- path: /b\n  backends: [{url: 'http://one.example'}]", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte("port: 8080\nroutes:\n"+tc.routes+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "route[0].backend[1]: duplicate backend URL") {
+					t.Fatalf("expected duplicate backend error, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
