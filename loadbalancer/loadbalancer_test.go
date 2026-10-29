@@ -103,6 +103,20 @@ func TestInvalidBackendURL(t *testing.T) {
 	}
 }
 
+func TestRejectDuplicateBackends(t *testing.T) {
+	for _, duplicate := range []string{"http://one.example", "HTTP://one.example"} {
+		t.Run(duplicate, func(t *testing.T) {
+			lb, err := New([]config.Backend{
+				{URL: "http://one.example"},
+				{URL: duplicate, Weight: 2},
+			})
+			if err == nil || lb != nil {
+				t.Fatal("duplicate backend must be rejected before it can bypass breaker accounting")
+			}
+		})
+	}
+}
+
 func TestHealthAwareSelection(t *testing.T) {
 	backends := []config.Backend{
 		{URL: "http://server1"},
