@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"reflect"
@@ -359,8 +360,13 @@ func validate(cfg *Config) error {
 		}
 		route.Algorithm = normalizedAlgo
 
-		if route.Algorithm == AlgorithmSticky && route.CookieName == "" {
-			route.CookieName = "SERVERID"
+		if route.Algorithm == AlgorithmSticky {
+			if route.CookieName == "" {
+				route.CookieName = "SERVERID"
+			}
+			if err := (&http.Cookie{Name: route.CookieName}).Valid(); err != nil {
+				return fmt.Errorf("route[%d].cookie_name %q: %w", i, route.CookieName, err)
+			}
 		}
 
 		if route.Retries < 0 {
