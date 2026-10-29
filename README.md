@@ -41,7 +41,7 @@ The core HTTP features are implemented and tested. The project still has correct
 
 Review scope: source and local validation on **2026-10-25**. These are current implementation limits, not claims that every deployment will encounter them.
 
-- **HTTP correctness:** headers named by `Connection` are not removed, `Trailer` handling is incomplete, and `X-Forwarded-Proto` is not sanitized or generated. Do not treat that header as an authenticated scheme signal.
+- **Trailers:** request and response trailers are deliberately dropped, including their `Trailer` declarations. Applications that require trailers are unsupported.
 - **URL forwarding:** use backend origin URLs such as `http://backend:9001`. Backend base paths and queries are rejected by configuration validation, and encoded path separators such as `%2F` are decoded during forwarding.
 - **Response failures:** response-copy failures are observed but headers already sent cannot be replaced; the client may receive a truncated response. These failures do not reset the backend breaker as a success.
 - **Resource controls:** application and redirect listener read/header/write/idle timeouts are unset; the management listener has bounded header, write, and idle timeouts. A positive route `timeout` limits each upstream attempt, but does not cover initial retry-body buffering or impose a total request deadline. Upload size, concurrent buffers, and tracked limiter identities have no configured hard cap.
@@ -170,6 +170,8 @@ The YAML schema rejects unknown fields at every level, duplicate mapping keys, a
 
 Backends must be absolute HTTP(S) origin URLs with valid hostnames or bracketed IPv6 addresses and valid optional ports. Credentials, base paths other than `/`, queries, and fragments are rejected because forwarding does not support them.
 
+Backend URLs must be unique within each route; use `weight` with weighted round-robin instead of repeating a URL. The same backend URL can be used in different routes.
+
 SIGHUP rereads the selected file and atomically replaces routes, backends, retry policies, limits, trusted proxies, and health-check settings. Requests already running finish with their previous configuration. Invalid files leave the active configuration intact and log an error. Changes to `port`, `management`, or any `tls` setting are rejected on reload and require a restart. Reload is signal-driven, not an automatic file watcher; use the binary's PID rather than the `go run` parent PID.
 
 Each successful reload starts fresh health, circuit-breaker, load-balancer, rate-limiter, and metrics state. Old health probes are canceled immediately; old limiter workers and idle connections are released after their in-flight requests finish. Management endpoint data switches together with the proxy configuration. Readiness waits for successful probes in the new generation.
@@ -226,6 +228,8 @@ Choose a route's `algorithm`:
 - `ip_hash`: selects a backend using the client IP. It hashes over the currently available backend list, so health changes can remap clients.
 - `sticky`: keeps a client on a backend using a cookie. Set a distinct `cookie_name` for each sticky route; the default is `SERVERID`. Cookies use `Path=/` and `HttpOnly`, without explicit `Secure`, `SameSite`, or expiry attributes.
 
+Sticky `cookie_name` values must be valid HTTP cookie names (ASCII token characters, without spaces, semicolons, or control characters); invalid names are rejected during configuration validation. An omitted or empty name uses `SERVERID`.
+
 Unhealthy backends and open circuits are skipped during selection.
 
 ### Defaults and limits
@@ -277,6 +281,17 @@ The upstream receives one sanitized `X-Forwarded-For` address without a port,
 rather than the original chain. Incoming `X-Real-IP` and `Forwarded` are removed.
 If the peer address cannot be parsed, requests share an empty identity and no
 client-IP header is forwarded.
+
+`X-Forwarded-Proto` is always replaced with one value derived from the connection
+into this proxy: `https` for TLS, otherwise `http`. Supplied scheme values are
+ignored even when the peer is in `trusted_proxies`; that setting only grants trust
+for client-IP resolution. When an ingress terminates TLS and connects to this
+proxy over HTTP, the forwarded scheme is `http`.
+
+In both directions, every field named by any `Connection` header is removed
+before the standard hop-by-hop headers are removed. Request trailer maps and
+both directions' `Trailer` declarations are dropped; response trailers are never
+forwarded. Ordinary end-to-end headers and bodies continue to be forwarded.
 
 ## Retry safety
 
