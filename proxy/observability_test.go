@@ -22,10 +22,13 @@ type observationTransport func(*http.Request) (*http.Response, error)
 
 func (f observationTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-type brokenBody struct{}
+type brokenBody struct{ closed bool }
 
-func (brokenBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
-func (brokenBody) Close() error             { return nil }
+func (*brokenBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (b *brokenBody) Close() error {
+	b.closed = true
+	return nil
+}
 
 func TestAttemptMetricsAndCompletionLog(t *testing.T) {
 	for _, tc := range []struct {
@@ -41,13 +44,21 @@ func TestAttemptMetricsAndCompletionLog(t *testing.T) {
 		{name: "response copy", outcome: "response_error", firstStatus: 200, broken: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r, err := router.New(&config.Config{Routes: []config.Route{{Path: "/api", Retries: 1, Backends: []config.Backend{{URL: "http://one"}, {URL: "http://two"}}}}})
+			r, err := router.New(&config.Config{Routes: []config.Route{{Path: "/api", Algorithm: "least_conn", Retries: 1, Backends: []config.Backend{{URL: "http://one"}, {URL: "http://two"}}}}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			calls := 0
+			failedBody := &brokenBody{}
+			entry, err := r.Match("/api")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.broken {
+				entry.LB.RecordFailure(entry.LB.BackendURL(0))
+			}
 			h := NewWithTransport(r, observationTransport(func(req *http.Request) (*http.Response, error) {
 				calls++
 				if calls == 1 {
@@ -59,7 +70,7 @@ func TestAttemptMetricsAndCompletionLog(t *testing.T) {
 					}
 					var body io.ReadCloser = io.NopCloser(strings.NewReader("failed"))
 					if tc.broken {
-						body = brokenBody{}
+						body = failedBody
 					}
 					return &http.Response{StatusCode: tc.firstStatus, Header: make(http.Header), Body: body}, nil
 				}
@@ -72,13 +83,28 @@ func TestAttemptMetricsAndCompletionLog(t *testing.T) {
 			req := httptest.NewRequest("GET", "/api/secret?token=secret", nil).WithContext(ctx)
 			req.Header.Set("Authorization", "Bearer secret")
 			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, req)
+			func() {
+				defer func() {
+					got := recover()
+					if tc.broken {
+						if got != http.ErrAbortHandler {
+							t.Fatalf("panic = %v, want http.ErrAbortHandler", got)
+						}
+					} else if got != nil {
+						t.Fatalf("unexpected panic: %v", got)
+					}
+				}()
+				handler.ServeHTTP(w, req)
+			}()
 			wantCalls := 2
 			if tc.broken || tc.canceled {
 				wantCalls = 1
 			}
 			if calls != wantCalls {
 				t.Fatalf("calls %d want %d", calls, wantCalls)
+			}
+			if tc.broken && (!failedBody.closed || entry.LB.ActiveConnections(0) != 0 || entry.LB.ConsecutiveFailures(0) != 1) {
+				t.Fatal("abort did not close the body, release the connection, or preserve breaker failures")
 			}
 			var record map[string]any
 			if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
@@ -89,6 +115,9 @@ func TestAttemptMetricsAndCompletionLog(t *testing.T) {
 			}
 			if strings.Contains(logs.String(), "secret") {
 				t.Fatal("request secrets logged")
+			}
+			if tc.broken && (record["outcome"] != "response_error" || record["status"] != float64(200) || w.Body.Len() != 0) {
+				t.Fatalf("incorrect abort log or appended error body: %s body=%q", logs.String(), w.Body.String())
 			}
 			scrape := httptest.NewRecorder()
 			m.Handler().ServeHTTP(scrape, httptest.NewRequest("GET", "/metrics", nil))
@@ -129,5 +158,46 @@ func TestAttemptMetricsDuration(t *testing.T) {
 	m.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
 	if !strings.Contains(w.Body.String(), `backend_attempt_duration_seconds_sum{route="/api",backend="http://one",status_code="200",outcome="success"} 0.125`) {
 		t.Fatal(w.Body.String())
+	}
+}
+
+func TestCompletionLogPropagatesPanics(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		value    any
+		canceled bool
+		want     string
+	}{
+		{"response abort", http.ErrAbortHandler, false, "response_error"},
+		{"unexpected panic", "unexpected", false, "aborted"},
+		{"canceled abort", http.ErrAbortHandler, true, "canceled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var logs bytes.Buffer
+			h := CompletionLogging(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				completionFrom(r).outcome = "response_error"
+				if tc.canceled {
+					cancel()
+				}
+				panic(tc.value)
+			}), slog.New(slog.NewJSONHandler(&logs, nil)))
+			func() {
+				defer func() {
+					if got := recover(); got != tc.value {
+						t.Fatalf("panic = %v, want %v", got, tc.value)
+					}
+				}()
+				h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil).WithContext(ctx))
+			}()
+			var record map[string]any
+			if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
+				t.Fatal(err)
+			}
+			if record["outcome"] != tc.want {
+				t.Fatalf("outcome = %v, want %s", record["outcome"], tc.want)
+			}
+		})
 	}
 }

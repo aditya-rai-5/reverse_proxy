@@ -380,10 +380,11 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	outcome = "success"
 	if err != nil {
 		outcome = "response_error"
+		// Headers are committed: abort delivery instead of completing a partial response.
+		panic(http.ErrAbortHandler)
 	} else if resp.StatusCode >= 500 {
 		outcome = "upstream_error"
 	}
-	// Headers have been sent: never retry or append an error after a copy failure.
 	return true, resp.StatusCode, err
 }
 

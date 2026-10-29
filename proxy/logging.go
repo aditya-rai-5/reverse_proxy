@@ -27,7 +27,8 @@ func CompletionLogging(next http.Handler, logger *slog.Logger) http.Handler {
 		tracked := &completionWriter{statusResponseWriter: statusResponseWriter{ResponseWriter: w}}
 		finished := false
 		defer func() {
-			if !finished {
+			panicked := recover()
+			if !finished && !(panicked == http.ErrAbortHandler && c.outcome == "response_error") {
 				c.outcome = "aborted"
 			}
 			if r.Context().Err() != nil {
@@ -37,6 +38,9 @@ func CompletionLogging(next http.Handler, logger *slog.Logger) http.Handler {
 				"backend", c.backend, "status", tracked.statusCode(), "bytes", tracked.bytes,
 				"duration_ms", float64(time.Since(started))/float64(time.Millisecond),
 				"attempts", c.attempts, "outcome", c.outcome)
+			if panicked != nil {
+				panic(panicked)
+			}
 		}()
 		next.ServeHTTP(tracked, r.WithContext(context.WithValue(r.Context(), completionKey{}, c)))
 		finished = true
