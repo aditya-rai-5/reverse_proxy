@@ -44,7 +44,7 @@ Review scope: source and local validation on **2026-10-25**. These are current i
 - **Trailers:** request and response trailers are deliberately dropped, including their `Trailer` declarations. Applications that require trailers are unsupported.
 - **URL forwarding:** use backend origin URLs such as `http://backend:9001`. Backend base paths and queries are rejected by configuration validation, and encoded path separators such as `%2F` are decoded during forwarding.
 - **Response failures:** response-copy failures abort the downstream connection or stream so clients can detect incomplete delivery. Partial data may already have arrived; the proxy does not retry or append an error body. These failures do not reset the backend breaker as a success.
-- **Resource controls:** application and redirect listener read/header/write/idle timeouts are unset; the management listener has bounded header, write, and idle timeouts. A positive route `timeout` limits each upstream attempt, but does not cover initial retry-body buffering or impose a total request deadline. Upload size, concurrent buffers, and tracked limiter identities have no configured hard cap.
+- **Resource controls:** application and redirect listeners have configurable header and idle timeouts and a header size limit. Whole-request read and response write timeouts remain unset to support uploads and streaming; the management listener has separate bounded header, write, and idle timeouts. A positive route `timeout` limits each upstream attempt, but does not cover initial retry-body buffering or impose a total request deadline. Upload size, concurrent buffers, and tracked limiter identities have no configured hard cap.
 - **Recovery and lifecycle:** half-open breakers admit multiple requests, late successes can close an open breaker, shutdown of stalled upstream requests still depends on request cancellation.
 - **Operations:** Management protection is a direct-peer IP allowlist, without user authentication or TLS. Use a private network and narrow CIDRs for remote monitoring. Rate limits and resilience state are local to each process. Sticky cookies have limited security/scoping controls.
 - **Protocols and deployment:** SSE (`text/event-stream`) headers and body chunks are flushed promptly; a positive route `timeout` still limits the stream duration. WebSocket/CONNECT tunnels, response trailers, and validated gRPC support are not implemented. Live ACME issuance, production load behavior, and release deployment are not covered by the local checks.
@@ -172,7 +172,7 @@ Backends must be absolute HTTP(S) origin URLs with valid hostnames or bracketed 
 
 Backend URLs must be unique within each route; use `weight` with weighted round-robin instead of repeating a URL. The same backend URL can be used in different routes.
 
-SIGHUP rereads the selected file and atomically replaces routes, backends, retry policies, limits, trusted proxies, and health-check settings. Requests already running finish with their previous configuration. Invalid files leave the active configuration intact and log an error. Changes to `port`, `management`, or any `tls` setting are rejected on reload and require a restart. Reload is signal-driven, not an automatic file watcher; use the binary's PID rather than the `go run` parent PID.
+SIGHUP rereads the selected file and atomically replaces routes, backends, retry policies, limits, trusted proxies, and health-check settings. Requests already running finish with their previous configuration. Invalid files leave the active configuration intact and log an error. Changes to `port`, `server`, `management`, or any `tls` setting are rejected on reload and require a restart. Reload is signal-driven, not an automatic file watcher; use the binary's PID rather than the `go run` parent PID.
 
 Each successful reload starts fresh health, circuit-breaker, load-balancer, rate-limiter, and metrics state. Old health probes are canceled immediately; old limiter workers and idle connections are released after their in-flight requests finish. Management endpoint data switches together with the proxy configuration. Readiness waits for successful probes in the new generation.
 
@@ -181,6 +181,11 @@ The following is a complete, smaller alternative to the checked-in configuration
 ```yaml
 port: 8080
 max_request_body_bytes: 10485760 # 10 MiB retry buffer per eligible request
+
+server:
+  read_header_timeout: 5s
+  idle_timeout: 60s
+  max_header_bytes: 1048576
 
 health_check:
   path: /health
@@ -235,6 +240,7 @@ Unhealthy backends and open circuits are skipped during selection.
 ### Defaults and limits
 
 - `port` is required, including when TLS is configured. Without TLS, it is the HTTP listener port.
+- `server` applies to the application HTTP/HTTPS listener and the HTTP-to-HTTPS redirect/ACME listener. Omitted or zero fields default to `read_header_timeout: 5s`, `idle_timeout: 60s`, and `max_header_bytes: 1048576` (1 MiB). Negative values and malformed settings are rejected. The header timeout bounds reading request headers; the idle timeout bounds waiting for the next keep-alive request. Header size follows Go's `http.Server.MaxHeaderBytes` semantics, including the request line and some parser read-ahead. These settings do not impose request-body or response-write deadlines; route timeouts still apply. Management listener settings are separate.
 - `management.address` defaults to `127.0.0.1:9091`; it must be a literal IP and a separate port. `management.allowed_cidrs` defaults to loopback ranges for loopback binds; non-loopback binds require an explicit allowlist.
 - `max_request_body_bytes` defaults to `10485760` (10 MiB) when omitted or zero. It limits retry buffering, **not upload size**: larger bodies stream to one backend without retries.
 - `health_check` defaults to `/health`, a `10s` interval, and a `5s` timeout. Probes use the backend's scheme and host plus this path, without route rewriting. Non-`2xx` responses and connection failures mark a backend unhealthy.

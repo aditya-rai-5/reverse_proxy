@@ -1,5 +1,11 @@
 port: 8080
 
+# Application and redirect listener limits; changes require a restart.
+server:
+  read_header_timeout: 5s
+  idle_timeout: 60s
+  max_header_bytes: 1048576
+
 # Management endpoints are available only to local connections by default.
 management:
   address: "127.0.0.1:9091"

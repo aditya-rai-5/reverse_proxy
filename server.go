@@ -27,11 +27,17 @@ func (s *serverPair) all() []*http.Server {
 }
 
 func newServers(cfg *config.Config, handler http.Handler) (*serverPair, error) {
+	newServer := func(port int, h http.Handler) *http.Server {
+		return &http.Server{
+			Addr:              fmt.Sprintf(":%d", port),
+			Handler:           h,
+			ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout,
+			IdleTimeout:       cfg.Server.IdleTimeout,
+			MaxHeaderBytes:    cfg.Server.MaxHeaderBytes,
+		}
+	}
 	if cfg.TLS == nil {
-		return &serverPair{app: &http.Server{
-			Addr:    fmt.Sprintf(":%d", cfg.Port),
-			Handler: handler,
-		}}, nil
+		return &serverPair{app: newServer(cfg.Port, handler)}, nil
 	}
 
 	tlsCfg := cfg.TLS
@@ -61,16 +67,11 @@ func newServers(cfg *config.Config, handler http.Handler) (*serverPair, error) {
 		redirectHandler = manager.HTTPHandler(redirectHandler)
 	}
 
+	app := newServer(tlsCfg.HTTPSPort, handler)
+	app.TLSConfig = serverTLS
 	return &serverPair{
-		app: &http.Server{
-			Addr:      fmt.Sprintf(":%d", tlsCfg.HTTPSPort),
-			Handler:   handler,
-			TLSConfig: serverTLS,
-		},
-		redirect: &http.Server{
-			Addr:    fmt.Sprintf(":%d", tlsCfg.HTTPPort),
-			Handler: redirectHandler,
-		},
+		app:         app,
+		redirect:    newServer(tlsCfg.HTTPPort, redirectHandler),
 		certManager: manager,
 	}, nil
 }

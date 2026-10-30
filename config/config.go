@@ -198,7 +198,15 @@ func (hc *HealthCheck) defaults() {
 	}
 }
 
+// Server configures the application and HTTP-to-HTTPS redirect listeners.
+type Server struct {
+	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
+	IdleTimeout       time.Duration `yaml:"idle_timeout"`
+	MaxHeaderBytes    int           `yaml:"max_header_bytes"`
+}
+
 type Config struct {
+	Server              Server      `yaml:"server"`
 	Management          Management  `yaml:"management"`
 	TrustedProxies      []string    `yaml:"trusted_proxies"`
 	Port                int         `yaml:"port"`
@@ -242,6 +250,21 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	if cfg.Server.ReadHeaderTimeout < 0 || cfg.Server.IdleTimeout < 0 {
+		return fmt.Errorf("server timeouts must be non-negative")
+	}
+	if cfg.Server.MaxHeaderBytes < 0 {
+		return fmt.Errorf("server.max_header_bytes must be non-negative")
+	}
+	if cfg.Server.ReadHeaderTimeout == 0 {
+		cfg.Server.ReadHeaderTimeout = 5 * time.Second
+	}
+	if cfg.Server.IdleTimeout == 0 {
+		cfg.Server.IdleTimeout = time.Minute
+	}
+	if cfg.Server.MaxHeaderBytes == 0 {
+		cfg.Server.MaxHeaderBytes = http.DefaultMaxHeaderBytes
 	}
 	if cfg.MaxRequestBodyBytes < 0 {
 		return fmt.Errorf("max_request_body_bytes must be non-negative")

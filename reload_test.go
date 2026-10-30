@@ -110,6 +110,18 @@ func TestReloadAtomicAndRollback(t *testing.T) {
 	if got := <-done; got != "old" {
 		t.Fatalf("in-flight response: %q", got)
 	}
+	for _, setting := range []string{"read_header_timeout: 2s", "idle_timeout: 15s", "max_header_bytes: 8192"} {
+		data := fmt.Sprintf("port: 8080\nserver: {%s}\nroutes: [{path: /, backends: [{url: %s}]}]", setting, old.URL)
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := runtime.reload(path); err == nil || !strings.Contains(err.Error(), "restart") {
+			t.Fatalf("listener setting reload: %v", err)
+		}
+		if got := request(); got != "new" {
+			t.Fatalf("listener setting rollback: %q", got)
+		}
+	}
 	for _, invalid := range []string{"port: -1", fmt.Sprintf("port: 9090\nroutes: [{path: /, backends: [{url: %s}]}]", old.URL), fmt.Sprintf("port: 8080\nmanagement: {address: \"127.0.0.1:9092\"}\nroutes: [{path: /, backends: [{url: %s}]}]", old.URL), fmt.Sprintf("port: 8080\nroutes: [{path: /, backends: [{url: %q}, {url: %q}]}]", old.URL, old.URL)} {
 		if err := os.WriteFile(path, []byte(invalid), 0600); err != nil {
 			t.Fatal(err)

@@ -110,7 +110,7 @@ func (r *runtimeHandler) reload(path string) error {
 	if old == nil {
 		return fmt.Errorf("runtime is closed")
 	}
-	if cfg.Port != old.cfg.Port || !reflect.DeepEqual(cfg.TLS, old.cfg.TLS) || !reflect.DeepEqual(cfg.Management, old.cfg.Management) {
+	if cfg.Port != old.cfg.Port || cfg.Server != old.cfg.Server || !reflect.DeepEqual(cfg.TLS, old.cfg.TLS) || !reflect.DeepEqual(cfg.Management, old.cfg.Management) {
 		return fmt.Errorf("listener, management, and TLS changes require a restart")
 	}
 	next, err := newGeneration(r.ctx, cfg)
