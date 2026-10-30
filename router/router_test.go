@@ -1,10 +1,35 @@
 package router
 
 import (
+	"net/url"
 	"testing"
 
 	"github.com/aditya-rai-5/reverse_proxy/config"
 )
+
+func TestRewriteURLPathRawPathValidation(t *testing.T) {
+	for _, raw := range []string{"/api/a%2Fb", "/wrong/a%2Fb", "/api/a%ZZb"} {
+		t.Run(raw, func(t *testing.T) {
+			u := &url.URL{Path: "/api/a/b", RawPath: raw}
+			entry := &Entry{StripPrefix: "/api"}
+			path, rawPath := entry.RewriteURLPath(u)
+			out := &url.URL{Path: path, RawPath: rawPath}
+			want := "/a/b"
+			if raw == "/api/a%2Fb" {
+				want = "/a%2Fb"
+			}
+			if got := out.EscapedPath(); got != want {
+				t.Errorf("escaped path = %q, want %q", got, want)
+			}
+			if rawPath != "" {
+				decoded, err := url.PathUnescape(rawPath)
+				if err != nil || decoded != path {
+					t.Errorf("inconsistent Path=%q RawPath=%q", path, rawPath)
+				}
+			}
+		})
+	}
+}
 
 func TestMatchesPath(t *testing.T) {
 	tests := []struct {
@@ -151,8 +176,8 @@ func TestRewritePath_StripPrefix(t *testing.T) {
 	}
 
 	tests := []struct {
-		routePath   string
-		inputPath   string
+		routePath    string
+		inputPath    string
 		expectedPath string
 	}{
 		{"/api", "/api/users", "/users"},

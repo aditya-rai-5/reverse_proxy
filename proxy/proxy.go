@@ -296,7 +296,6 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	}
 
 	target := result.URL
-	rewrittenPath := entry.RewritePath(r.URL.Path)
 
 	ctx := r.Context()
 	var cancel context.CancelFunc
@@ -308,8 +307,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	outReq := r.Clone(ctx)
 	outReq.URL.Scheme = target.Scheme
 	outReq.URL.Host = target.Host
-	outReq.URL.Path = rewrittenPath
-	outReq.URL.RawPath = ""
+	outReq.URL.Path, outReq.URL.RawPath = entry.RewriteURLPath(r.URL)
 	outReq.RequestURI = ""
 	// Trailers are unsupported: drop the request trailer map as well as its
 	// declaration, so Transport cannot regenerate or forward trailers.

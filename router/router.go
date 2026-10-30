@@ -67,25 +67,57 @@ func (e *Entry) SelectExcluding(req *http.Request, excluded map[string]bool) (*l
 // RewritePath applies configured prefix stripping and regex rewriting to requestPath.
 // The returned path is guaranteed to begin with '/'.
 func (e *Entry) RewritePath(requestPath string) string {
-	p := requestPath
+	p, _ := e.RewriteURLPath(&url.URL{Path: requestPath})
+	return p
+}
+
+// RewriteURLPath returns a consistent Path and RawPath pair. Prefix stripping
+// preserves escaped suffixes; a regex that changes Path discards the old RawPath.
+func (e *Entry) RewriteURLPath(u *url.URL) (string, string) {
+	p, raw := u.Path, u.RawPath
+	if raw != "" {
+		raw = u.EscapedPath() // Ignore an invalid or stale RawPath.
+	}
 
 	// 1. Strip prefix if configured
 	if e.StripPrefix != "" && strings.HasPrefix(p, e.StripPrefix) {
+		if raw != "" {
+			// Each percent triplet represents one byte of the decoded prefix.
+			i := 0
+			for n := 0; n < len(e.StripPrefix); n++ {
+				if raw[i] == '%' {
+					i += 3
+				} else {
+					i++
+				}
+			}
+			raw = raw[i:]
+		}
 		p = strings.TrimPrefix(p, e.StripPrefix)
 		if p == "" || p[0] != '/' {
 			p = "/" + p
+			if raw != "" {
+				raw = "/" + raw
+			}
+		} else if raw != "" && raw[0] != '/' {
+			// HTTP origin-form requires a literal leading slash.
+			raw = "/" + raw[3:]
 		}
 	}
 
 	// 2. Regex rewrite if configured
 	if e.rewriteRe != nil {
+		before := p
 		p = e.rewriteRe.ReplaceAllString(p, e.replacement)
 		if p == "" || p[0] != '/' {
 			p = "/" + p
 		}
+		if p != before {
+			raw = ""
+		}
 	}
 
-	return p
+	return p, raw
 }
 
 type Router struct {
