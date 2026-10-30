@@ -34,7 +34,7 @@ services:
     command: ["-listen=:9003", "-text=controlled backend failure", "-status-code=502"]
 
   prometheus:
-    image: prom/prometheus:v3.15.0
+    image: prom/prometheus:v3.15.1
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
