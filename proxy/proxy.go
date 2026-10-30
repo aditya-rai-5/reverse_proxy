@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"strings"
@@ -376,7 +377,15 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	copyHeader(w.Header(), resp.Header)
 
 	w.WriteHeader(resp.StatusCode)
-	_, err = io.Copy(w, resp.Body)
+	var dst io.Writer = w
+	if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mediaType == "text/event-stream" {
+		stream := flushWriter{Writer: w, controller: http.NewResponseController(w)}
+		err = stream.flush()
+		dst = stream
+	}
+	if err == nil {
+		_, err = io.Copy(dst, resp.Body)
+	}
 	outcome = "success"
 	if err != nil {
 		outcome = "response_error"
@@ -386,6 +395,28 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 		outcome = "upstream_error"
 	}
 	return true, resp.StatusCode, err
+}
+
+// flushWriter delivers SSE chunks through the existing response accounting wrappers.
+type flushWriter struct {
+	io.Writer
+	controller *http.ResponseController
+}
+
+func (w flushWriter) flush() error {
+	err := w.controller.Flush()
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
+}
+
+func (w flushWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if err == nil {
+		err = w.flush()
+	}
+	return n, err
 }
 
 func removeHopByHopHeaders(h http.Header) {
