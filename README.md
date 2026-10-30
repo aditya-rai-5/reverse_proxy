@@ -319,7 +319,7 @@ routes:
       - url: http://payments-2:9002
 ```
 
-`POST`, `PATCH`, `PUT`, and `DELETE` additionally require exactly one non-empty `Idempotency-Key` request header. The same key and buffered body are forwarded on each attempt. A key alone does not enable retries, and oversized bodies still stream once.
+`POST`, `PATCH`, `PUT`, and `DELETE` additionally require exactly one non-empty `Idempotency-Key` request header. The same key and buffered body are forwarded on each attempt. If `Connection` names `Idempotency-Key`, the key is removed during forwarding and write retries are disabled. A key alone does not enable retries, and oversized bodies still stream once.
 
 Enable write retries only when **all backends share durable, atomic deduplication** for the key, bind it to the operation and payload, and retain the result long enough for retries. The proxy does not store keys or deduplicate writes.
 
