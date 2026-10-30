@@ -118,6 +118,69 @@ func TestProxyExplicitWriteRetryUsesSharedIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestProxyConnectionIdempotencyKeyRetrySafety(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		connection []string
+		stripped   bool
+	}{
+		{"normal", nil, false},
+		{"unrelated token", []string{"X-Idempotency-Key"}, false},
+		{"nominated", []string{"Idempotency-Key"}, true},
+		{"mixed case", []string{"keep-alive, iDeMpOtEnCy-KeY"}, true},
+		{"multiple lines", []string{"keep-alive", " \tIdempotency-Key , X-Other"}, true},
+	} {
+		for _, payload := range []string{"", "charge=100"} {
+			t.Run(tc.name+"/"+payload, func(t *testing.T) {
+				r := retryTestRouter(t, []string{http.MethodPost}, "")
+				calls, writes := 0, 0
+				seen := make(map[string]bool)
+				h := NewWithTransport(r, roundTripperFunc(func(out *http.Request) (*http.Response, error) {
+					calls++
+					key := out.Header.Get("Idempotency-Key")
+					wantKey := "charge-once"
+					if tc.stripped {
+						wantKey = ""
+						if out.GetBody != nil || out.Body == nil || out.Body == http.NoBody {
+							t.Error("ineligible write remains transport replayable")
+						}
+					}
+					if key != wantKey || out.Header.Get("Connection") != "" {
+						t.Errorf("unexpected forwarded headers: %v", out.Header)
+					}
+					body, err := io.ReadAll(out.Body)
+					out.Body.Close()
+					if err != nil || string(body) != payload {
+						t.Errorf("body=%q err=%v", body, err)
+					}
+					// All backends share deduplication, but unkeyed writes always apply.
+					if key == "" || !seen[key] {
+						writes++
+						seen[key] = true
+					}
+					if calls == 1 {
+						return retryTestResponse(http.StatusBadGateway, "failed after write"), nil
+					}
+					return retryTestResponse(http.StatusCreated, "done"), nil
+				}))
+				req := httptest.NewRequest(http.MethodPost, "/charge", strings.NewReader(payload))
+				req.Header.Set("Idempotency-Key", "charge-once")
+				req.Header["Connection"] = tc.connection
+				req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(payload)), nil }
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+				wantCalls, wantStatus := 2, http.StatusCreated
+				if tc.stripped {
+					wantCalls, wantStatus = 1, http.StatusBadGateway
+				}
+				if calls != wantCalls || writes != 1 || rec.Code != wantStatus {
+					t.Fatalf("calls=%d writes=%d status=%d; want %d, 1, %d", calls, writes, rec.Code, wantCalls, wantStatus)
+				}
+			})
+		}
+	}
+}
+
 func TestProxyClientKeyDoesNotEnableTransportRetry(t *testing.T) {
 	var writes atomic.Int64
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

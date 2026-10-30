@@ -59,6 +59,21 @@ func TestRouterRejectsInvalidProgrammaticRetryPolicy(t *testing.T) {
 	}
 }
 
+func TestRouterRetryPolicyWithHopByHopKey(t *testing.T) {
+	for _, method := range []string{"GET", "HEAD", "OPTIONS", "POST", "PATCH", "PUT", "DELETE"} {
+		t.Run(method, func(t *testing.T) {
+			entry := Entry{RetryMethods: []string{method}}
+			req := httptest.NewRequest(method, "/", nil)
+			req.Header.Set("Idempotency-Key", "once")
+			req.Header.Set("Connection", "Idempotency-Key")
+			want := method == "GET" || method == "HEAD" || method == "OPTIONS"
+			if got := entry.CanRetry(req); got != want {
+				t.Errorf("CanRetry=%v want=%v", got, want)
+			}
+		})
+	}
+}
+
 func TestRouterCopiesRetryMethods(t *testing.T) {
 	methods := []string{http.MethodPost}
 	r, err := New(&config.Config{Routes: []config.Route{{Path: "/", RetryMethods: methods, Backends: []config.Backend{{URL: "http://one.example"}}}}})

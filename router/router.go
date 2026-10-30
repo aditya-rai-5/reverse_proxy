@@ -29,7 +29,7 @@ type Entry struct {
 }
 
 // CanRetry requires route opt-in and a single nonempty Idempotency-Key for write
-// methods.
+// methods. The key must not be nominated for removal by Connection.
 func (e *Entry) CanRetry(req *http.Request) bool {
 	if req == nil {
 		return false
@@ -42,6 +42,14 @@ func (e *Entry) CanRetry(req *http.Request) bool {
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
 			return true
 		default:
+			// Forwarding removes Connection-nominated headers before each attempt.
+			for _, value := range req.Header.Values("Connection") {
+				for _, token := range strings.Split(value, ",") {
+					if strings.EqualFold(strings.TrimSpace(token), "Idempotency-Key") {
+						return false
+					}
+				}
+			}
 			keys := req.Header.Values("Idempotency-Key")
 			return len(keys) == 1 && strings.TrimSpace(keys[0]) != ""
 		}
