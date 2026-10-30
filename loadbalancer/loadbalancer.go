@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
@@ -40,14 +41,22 @@ func (be *backend) isAvailable(excluded map[string]bool) bool {
 	return be.healthy.Load() && be.cb.AllowRequest()
 }
 
-// Result is returned by Select and includes the selected URL, an optional
-// Done cleanup function (e.g. for decrementing active connections), and an
-// optional HTTP Cookie to be set in the response (for sticky sessions).
+// Result is returned by Select and includes the selected URL and an optional
+// sticky-session cookie. Call RecordSuccess or RecordFailure for a completed
+// attempt, then Done to clean up. On cancellation, call only Done.
 type Result struct {
-	URL    *url.URL
-	Done   func()
-	Cookie *http.Cookie
+	URL     *url.URL
+	Done    func()
+	Cookie  *http.Cookie
+	breaker *circuitbreaker.CircuitBreaker
+	permit  *circuitbreaker.Permit
 }
+
+// RecordSuccess completes the selected request successfully.
+func (r *Result) RecordSuccess() { r.permit.RecordSuccess() }
+
+// RecordFailure completes the selected request with an upstream failure.
+func (r *Result) RecordFailure() { r.permit.RecordFailure() }
 
 // Option configures a LoadBalancer.
 type Option func(*LoadBalancer)
@@ -152,6 +161,36 @@ func (lb *LoadBalancer) Select(req *http.Request) (*Result, error) {
 
 // SelectExcluding routes a request to an appropriate backend, excluding any URLs present in excluded.
 func (lb *LoadBalancer) SelectExcluding(req *http.Request, excluded map[string]bool) (*Result, error) {
+	for {
+		result, err := lb.selectCandidate(req, excluded)
+		if err != nil {
+			return nil, err
+		}
+		if permit := result.breaker.Acquire(); permit != nil {
+			result.permit = permit
+			cleanup := result.Done
+			result.Done = sync.OnceFunc(func() {
+				permit.Release()
+				if cleanup != nil {
+					cleanup()
+				}
+			})
+			return result, nil
+		}
+		// Another request may have reserved the candidate after the eligibility
+		// scan. Undo selection accounting and try a different backend.
+		if result.Done != nil {
+			result.Done()
+		}
+		excluded = maps.Clone(excluded)
+		if excluded == nil {
+			excluded = make(map[string]bool)
+		}
+		excluded[result.URL.String()] = true
+	}
+}
+
+func (lb *LoadBalancer) selectCandidate(req *http.Request, excluded map[string]bool) (*Result, error) {
 	switch lb.algorithm {
 	case config.AlgorithmWeightedRoundRobin:
 		return lb.nextWeightedRoundRobin(excluded)
@@ -168,9 +207,8 @@ func (lb *LoadBalancer) SelectExcluding(req *http.Request, excluded map[string]b
 	}
 }
 
-// Next returns the next healthy backend URL using the configured algorithm.
-// If the selected algorithm provides a cleanup function (such as Least Connections),
-// Next calls it immediately.
+// Next returns the next healthy backend URL and immediately releases selection
+// resources. Use Select for forwarding to hold a recovery probe until completion.
 func (lb *LoadBalancer) Next() (*url.URL, error) {
 	res, err := lb.Select(nil)
 	if err != nil {
@@ -192,7 +230,7 @@ func (lb *LoadBalancer) nextRoundRobin(excluded map[string]bool) (*Result, error
 	for i := uint64(0); i < n; i++ {
 		be := lb.backends[(start+i)%n]
 		if be.isAvailable(excluded) {
-			return &Result{URL: be.url}, nil
+			return &Result{URL: be.url, breaker: be.cb}, nil
 		}
 	}
 
@@ -224,7 +262,7 @@ func (lb *LoadBalancer) nextWeightedRoundRobin(excluded map[string]bool) (*Resul
 	}
 
 	chosen.currentWeight -= totalWeight
-	return &Result{URL: chosen.url}, nil
+	return &Result{URL: chosen.url, breaker: chosen.cb}, nil
 }
 
 // nextLeastConn routes to the healthy backend with the lowest active in-flight requests.
@@ -261,8 +299,9 @@ func (lb *LoadBalancer) nextLeastConn(excluded map[string]bool) (*Result, error)
 	}
 
 	return &Result{
-		URL:  chosen.url,
-		Done: done,
+		URL:     chosen.url,
+		Done:    done,
+		breaker: chosen.cb,
 	}, nil
 }
 
@@ -285,7 +324,7 @@ func (lb *LoadBalancer) nextIPHash(req *http.Request, excluded map[string]bool) 
 	hashVal := h.Sum32()
 
 	chosen := healthy[hashVal%uint32(len(healthy))]
-	return &Result{URL: chosen.url}, nil
+	return &Result{URL: chosen.url, breaker: chosen.cb}, nil
 }
 
 // nextSticky uses a session cookie to maintain affinity to the chosen backend.
@@ -296,7 +335,7 @@ func (lb *LoadBalancer) nextSticky(req *http.Request, excluded map[string]bool) 
 			for _, be := range lb.backends {
 				if be.id == cookie.Value {
 					if be.isAvailable(excluded) {
-						return &Result{URL: be.url}, nil
+						return &Result{URL: be.url, breaker: be.cb}, nil
 					}
 					break
 				}

@@ -219,20 +219,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		excluded[target.String()] = true
 
-		success, statusCode, err := h.forward(w, r, entry, result, bodyBytes, bufferedBody, maxAttempts > 1)
+		success, statusCode := func() (bool, int) {
+			// Record the outcome before releasing the recovery probe. Cancellation
+			// and panics still release it without changing failure accounting.
+			defer result.Done()
+			success, statusCode, err := h.forward(w, r, entry, result, bodyBytes, bufferedBody, maxAttempts > 1)
+			if r.Context().Err() == nil {
+				if success && err == nil {
+					result.RecordSuccess()
+				} else if !success {
+					result.RecordFailure()
+				}
+			}
+			return success, statusCode
+		}()
 		// A route timeout leaves the original request context alive. Only client
 		// cancellation/deadline stops retries without blaming the backend.
 		if stopIfCanceled() {
 			return
 		}
 		if success {
-			if err == nil {
-				entry.LB.RecordSuccess(target)
-			}
 			return
 		}
 
-		entry.LB.RecordFailure(target)
 		lastStatusCode = statusCode
 	}
 	if stopIfCanceled() {
@@ -291,9 +300,6 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 			completion.outcome = outcome
 		}
 	}()
-	if result.Done != nil {
-		defer result.Done()
-	}
 
 	target := result.URL
 

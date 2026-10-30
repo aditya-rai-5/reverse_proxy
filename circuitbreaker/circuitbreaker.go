@@ -37,6 +37,8 @@ type CircuitBreaker struct {
 	consecutiveFailures int
 	trips               uint64
 	lastStateChange     time.Time
+	probeInFlight       bool
+	generation          uint64
 }
 
 // New creates a new CircuitBreaker with the given configuration.
@@ -49,38 +51,69 @@ func New(cfg Config) *CircuitBreaker {
 	}
 }
 
-// AllowRequest returns true if a request is permitted according to current circuit state.
+// AllowRequest checks eligibility without reserving a recovery probe.
+// Use Acquire when dispatching a request.
 func (cb *CircuitBreaker) AllowRequest() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	return cb.stateLocked() != StateOpen && !cb.probeInFlight
+}
 
-	now := time.Now()
-	switch cb.state {
-	case StateClosed:
-		return true
-	case StateOpen:
-		if now.Sub(cb.lastStateChange) >= cb.config.Cooldown {
-			cb.state = StateHalfOpen
-			cb.lastStateChange = now
-			return true
-		}
-		return false
-	case StateHalfOpen:
-		return true
-	default:
-		return true
+// Permit tracks an admitted request. Finish it with RecordSuccess, RecordFailure,
+// or Release on cancellation. Only the first completion takes effect.
+type Permit struct {
+	cb         *CircuitBreaker
+	generation uint64
+	once       sync.Once
+}
+
+// Acquire admits a request, reserving the sole probe if the circuit is half-open.
+// It returns nil when the backend is unavailable.
+func (cb *CircuitBreaker) Acquire() *Permit {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.stateLocked() == StateOpen || cb.probeInFlight {
+		return nil
 	}
+	cb.probeInFlight = cb.state == StateHalfOpen
+	return &Permit{cb: cb, generation: cb.generation}
+}
+
+// RecordSuccess completes this request successfully.
+func (p *Permit) RecordSuccess() { p.finish(p.cb.recordSuccessLocked) }
+
+// RecordFailure completes this request with an upstream failure.
+func (p *Permit) RecordFailure() { p.finish(p.cb.recordFailureLocked) }
+
+// Release cancels this request's reservation without changing failure counts.
+func (p *Permit) Release() { p.finish(nil) }
+
+func (p *Permit) finish(record func()) {
+	p.once.Do(func() {
+		p.cb.mu.Lock()
+		defer p.cb.mu.Unlock()
+		// Requests admitted before a state transition cannot complete a newer probe.
+		if p.generation != p.cb.generation {
+			return
+		}
+		p.cb.probeInFlight = false
+		if record != nil {
+			record()
+		}
+	})
 }
 
 // RecordSuccess records a successful request, resetting failures and closing the circuit.
 func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	cb.recordSuccessLocked()
+}
 
+func (cb *CircuitBreaker) recordSuccessLocked() {
 	cb.consecutiveFailures = 0
 	if cb.state != StateClosed {
-		cb.state = StateClosed
-		cb.lastStateChange = time.Now()
+		cb.setStateLocked(StateClosed)
 	}
 }
 
@@ -88,20 +121,21 @@ func (cb *CircuitBreaker) RecordSuccess() {
 func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	cb.recordFailureLocked()
+}
 
+func (cb *CircuitBreaker) recordFailureLocked() {
 	cb.consecutiveFailures++
 	now := time.Now()
 
 	switch cb.state {
 	case StateHalfOpen:
-		cb.state = StateOpen
+		cb.setStateLocked(StateOpen)
 		cb.trips++
-		cb.lastStateChange = now
 	case StateClosed:
 		if cb.consecutiveFailures >= cb.config.FailureThreshold {
-			cb.state = StateOpen
+			cb.setStateLocked(StateOpen)
 			cb.trips++
-			cb.lastStateChange = now
 		}
 	case StateOpen:
 		cb.lastStateChange = now
@@ -112,12 +146,21 @@ func (cb *CircuitBreaker) RecordFailure() {
 func (cb *CircuitBreaker) State() State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	return cb.stateLocked()
+}
 
+func (cb *CircuitBreaker) stateLocked() State {
 	if cb.state == StateOpen && time.Since(cb.lastStateChange) >= cb.config.Cooldown {
-		cb.state = StateHalfOpen
-		cb.lastStateChange = time.Now()
+		cb.setStateLocked(StateHalfOpen)
 	}
 	return cb.state
+}
+
+func (cb *CircuitBreaker) setStateLocked(state State) {
+	cb.state = state
+	cb.lastStateChange = time.Now()
+	cb.probeInFlight = false
+	cb.generation++
 }
 
 // ConsecutiveFailures returns the current number of consecutive failures recorded.
@@ -138,7 +181,6 @@ func (cb *CircuitBreaker) Trips() uint64 {
 func (cb *CircuitBreaker) Reset() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.state = StateClosed
+	cb.setStateLocked(StateClosed)
 	cb.consecutiveFailures = 0
-	cb.lastStateChange = time.Now()
 }
