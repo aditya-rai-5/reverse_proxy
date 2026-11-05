@@ -27,6 +27,8 @@ func (s *serverPair) all() []*http.Server {
 }
 
 func newServers(cfg *config.Config, handler http.Handler) (*serverPair, error) {
+	// Bound headers and idle connections without imposing listener-wide upload
+	// or stream deadlines; routes can opt into total_timeout.
 	newServer := func(port int, h http.Handler) *http.Server {
 		return &http.Server{
 			Addr:              fmt.Sprintf(":%d", port),

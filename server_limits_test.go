@@ -54,21 +54,34 @@ func dialListenerTestServer(t *testing.T, ts *httptest.Server) net.Conn {
 
 func TestListenerRejectsSlowAndOversizedHeaders(t *testing.T) {
 	cert, key := writeTestCertificate(t)
-	for _, mode := range []string{"HTTP", "HTTPS", "redirect"} {
+	for _, mode := range []string{"HTTP", "HTTPS", "redirect", "ACME redirect", "management"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg := &config.Config{Port: 8080, Server: config.Server{
 				ReadHeaderTimeout: 100 * time.Millisecond, IdleTimeout: 100 * time.Millisecond, MaxHeaderBytes: 1024,
 			}}
-			if mode != "HTTP" {
+			if mode == "HTTPS" || mode == "redirect" || mode == "ACME redirect" {
 				cfg.TLS = &config.TLS{CertFile: cert, KeyFile: key, HTTPPort: 8081, HTTPSPort: 8443}
+			}
+			if mode == "ACME redirect" {
+				cfg.TLS = &config.TLS{AutoCert: true, Domains: []string{"proxy.example.com"}, CacheDir: t.TempDir(), HTTPPort: 8081, HTTPSPort: 8443}
 			}
 			servers, err := newServers(cfg, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
 			if err != nil {
 				t.Fatal(err)
 			}
 			srv := servers.app
-			if mode == "redirect" {
+			if mode == "redirect" || mode == "ACME redirect" {
 				srv = servers.redirect
+			}
+			if mode == "management" {
+				srv = newManagementServer(config.Management{Address: "127.0.0.1:9091", AllowedCIDRs: []string{"127.0.0.0/8", "::1/128"}}, http.NotFoundHandler())
+				if srv.ReadHeaderTimeout != 5*time.Second || srv.IdleTimeout != 30*time.Second || srv.WriteTimeout != 10*time.Second {
+					t.Fatalf("unexpected management timeout policy: %+v", srv)
+				}
+				// Shorten durations for socket tests after checking the production policy.
+				srv.ReadHeaderTimeout = cfg.Server.ReadHeaderTimeout
+				srv.IdleTimeout = cfg.Server.IdleTimeout
+				srv.MaxHeaderBytes = cfg.Server.MaxHeaderBytes
 			}
 			ts := startListenerTestServer(t, srv)
 			t.Run("slow headers", func(t *testing.T) {
@@ -101,6 +114,38 @@ func TestListenerRejectsSlowAndOversizedHeaders(t *testing.T) {
 				defer resp.Body.Close()
 				if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
 					t.Fatalf("oversized headers returned %d", resp.StatusCode)
+				}
+			})
+			t.Run("slow headers after keep-alive", func(t *testing.T) {
+				conn := dialListenerTestServer(t, ts)
+				if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
+					t.Fatal(err)
+				}
+				reader := bufio.NewReader(conn)
+				resp, err := http.ReadResponse(reader, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+					t.Fatal(err)
+				}
+				resp.Body.Close()
+				if resp.Close {
+					t.Fatal("first response disabled keep-alive")
+				}
+				if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nX-Slow: "); err != nil {
+					t.Fatal(err)
+				}
+				resp, err = http.ReadResponse(reader, nil)
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					return
+				}
+				if err != nil {
+					t.Fatalf("server did not reject second request before client deadline: %v", err)
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("slow second headers returned %d", resp.StatusCode)
 				}
 			})
 			t.Run("idle connection", func(t *testing.T) {
@@ -247,5 +292,68 @@ func TestListenerSettings(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestListenerTLSHandshakeTimeout(t *testing.T) {
+	cert, key := writeTestCertificate(t)
+	for _, autoCert := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ACME=%v", autoCert), func(t *testing.T) {
+			cfg := &config.Config{Server: config.Server{ReadHeaderTimeout: 100 * time.Millisecond}, TLS: &config.TLS{CertFile: cert, KeyFile: key, AutoCert: autoCert, Domains: []string{"proxy.example.com"}, CacheDir: t.TempDir(), HTTPPort: 8080, HTTPSPort: 8443}}
+			servers, err := newServers(cfg, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("handler ran before TLS handshake completed") }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ts := startListenerTestServer(t, servers.app)
+			conn, err := net.DialTimeout("tcp", ts.Listener.Addr().String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			// An incomplete TLS record must not retain a connection indefinitely.
+			if _, err := conn.Write([]byte{0x16, 0x03}); err != nil {
+				t.Fatal(err)
+			}
+			var b [1]byte
+			if _, err := conn.Read(b[:]); err != io.EOF {
+				t.Fatalf("expected handshake timeout to close connection, got %v", err)
+			}
+		})
+	}
+}
+
+func TestManagementWriteTimeout(t *testing.T) {
+	writeResult := make(chan error, 1)
+	srv := newManagementServer(config.Management{AllowedCIDRs: []string{"127.0.0.0/8", "::1/128"}}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		controller := http.NewResponseController(w)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: first\n\n")
+		if err := controller.Flush(); err != nil {
+			writeResult <- err
+			return
+		}
+		time.Sleep(150 * time.Millisecond)
+		fmt.Fprint(w, "data: late\n\n")
+		writeResult <- controller.Flush()
+	}))
+	// Exercise the configured policy without waiting ten seconds per test.
+	srv.WriteTimeout = 50 * time.Millisecond
+	ts := startListenerTestServer(t, srv)
+	client := ts.Client()
+	client.Timeout = 2 * time.Second
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err == nil || string(body) != "data: first\n\n" {
+		t.Fatalf("body=%q error=%v; expected truncated response", body, err)
+	}
+	if err := <-writeResult; err == nil {
+		t.Fatal("late write did not hit the management write deadline")
 	}
 }
