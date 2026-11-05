@@ -17,6 +17,7 @@ import (
 )
 
 type Entry struct {
+	TotalTimeout time.Duration
 	Path         string
 	StripPrefix  string
 	LB           *loadbalancer.LoadBalancer
@@ -179,6 +180,7 @@ func New(cfg *config.Config) (*Router, error) {
 			Retries:      route.Retries,
 			RetryMethods: retryMethods,
 			Timeout:      route.Timeout,
+			TotalTimeout: route.TotalTimeout,
 			RateLimiter:  rl,
 		}
 

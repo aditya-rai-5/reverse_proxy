@@ -44,10 +44,10 @@ Review scope: source and local validation on **2026-10-25**. These are current i
 - **Trailers:** request and response trailers are deliberately dropped, including their `Trailer` declarations. Applications that require trailers are unsupported.
 - **URL forwarding:** use backend origin URLs such as `http://backend:9001`. Backend base paths and queries are rejected by configuration validation, and encoded path separators such as `%2F` are decoded during forwarding.
 - **Response failures:** response-copy failures abort the downstream connection or stream so clients can detect incomplete delivery. Partial data may already have arrived; the proxy does not retry or append an error body. These failures do not reset the backend breaker as a success.
-- **Resource controls:** application and redirect listeners have configurable header and idle timeouts and a header size limit. Whole-request read and response write timeouts remain unset to support uploads and streaming; the management listener has separate bounded header, write, and idle timeouts. A positive route `timeout` limits each upstream attempt, but does not cover initial retry-body buffering or impose a total request deadline. Upload size, concurrent buffers, and tracked limiter identities have no configured hard cap.
+- **Resource controls:** application and redirect listeners have configurable header and idle timeouts and a header size limit. Server-wide request-body read and response write timeouts remain unset to support uploads and streaming; the management listener has separate bounded header, write, and idle timeouts. A positive route `timeout` limits each upstream attempt. Optional `total_timeout` bounds retry-body buffering, all attempts, and response delivery together. Upload size, concurrent buffers, and tracked limiter identities have no configured hard cap.
 - **Recovery and lifecycle:** each half-open breaker admits one recovery request at a time. Shutdown of stalled upstream requests still depends on request cancellation.
 - **Operations:** Management protection is a direct-peer IP allowlist, without user authentication or TLS. Use a private network and narrow CIDRs for remote monitoring. Rate limits and resilience state are local to each process. Sticky cookies have limited security/scoping controls.
-- **Protocols and deployment:** SSE (`text/event-stream`) headers and body chunks are flushed promptly; a positive route `timeout` still limits the stream duration. WebSocket/CONNECT tunnels, response trailers, and validated gRPC support are not implemented. Live ACME issuance, production load behavior, and release deployment are not covered by the local checks.
+- **Protocols and deployment:** SSE (`text/event-stream`) headers and body chunks are flushed promptly; positive route `timeout` and `total_timeout` values still limit the stream duration. WebSocket/CONNECT tunnels, response trailers, and validated gRPC support are not implemented. Live ACME issuance, production load behavior, and release deployment are not covered by the local checks.
 
 Dynamic service discovery, authentication middleware, distributed rate limits, and release publishing are also outside the current implementation. Report reproducible bugs using the [contribution guide](CONTRIBUTING.md#report-a-bug-or-propose-a-feature).
 
@@ -203,6 +203,7 @@ routes:
     retries: 1
     retry_methods: [GET, HEAD, OPTIONS]
     timeout: 3s
+    total_timeout: 10s
     circuit_breaker:
       failure_threshold: 5
       cooldown: 10s
@@ -244,7 +245,8 @@ Unhealthy backends and open circuits are skipped during selection.
 - `management.address` defaults to `127.0.0.1:9091`; it must be a literal IP and a separate port. `management.allowed_cidrs` defaults to loopback ranges for loopback binds; non-loopback binds require an explicit allowlist.
 - `max_request_body_bytes` defaults to `10485760` (10 MiB) when omitted or zero. It limits retry buffering, **not upload size**: larger bodies stream to one backend without retries.
 - `health_check` defaults to `/health`, a `10s` interval, and a `5s` timeout. Probes use the backend's scheme and host plus this path, without route rewriting. Non-`2xx` responses and connection failures mark a backend unhealthy.
-- `timeout` is a per-attempt upstream timeout, such as `3s`. Omitted or zero adds no route-specific deadline.
+- `timeout` is a per-attempt upstream timeout, such as `3s`. Omitted or zero adds no per-attempt deadline.
+- `total_timeout` is an optional whole-request budget, such as `10s`, starting when the proxy handler receives the request after header parsing. It includes retry-body buffering, uploads, all upstream attempts, and response delivery, including SSE. Omitted or zero disables it; negative or malformed values are rejected. The earlier of this deadline, the caller deadline, and each attempt timeout applies. Expiry stops retries and cancels upstream work without increasing backend failure counters. Before response headers are committed it returns `504`; after commitment it aborts the response without appending an error. Slow clients may not receive an error response. Route deadline changes apply on config reload.
 - `circuit_breaker` defaults to a failure threshold of `5` and a `10s` cooldown, even when the section is omitted. Successful health probes update backend health but do not clear circuit-breaker failures, close the circuit, or bypass cooldown. After cooldown, a healthy backend admits one application recovery request at a time in the half-open state. Other requests use another available backend or receive `503` if none is available. A successful recovery request closes the circuit and clears its failures; an upstream failure reopens it and restarts cooldown. Cancellation releases the recovery slot without counting a failure. Late completions from an earlier circuit state cannot change the current state. Candidate scans, health reads, and metrics reads do not reserve recovery requests.
 - `rate_limit.requests_per_minute` enables per-IP limiting when positive. Omitted or zero disables that limiter. For an enabled limiter, omitted or zero `burst` defaults to `1`.
 
@@ -329,7 +331,7 @@ routes:
 
 Enable write retries only when **all backends share durable, atomic deduplication** for the key, bind it to the operation and payload, and retain the result long enough for retries. The proxy does not store keys or deduplicate writes.
 
-Client cancellation stops retries without increasing backend failure counters. Observations use `499` for cancellation and `504` for an expired client deadline; a disconnected client may not receive a response. A route's per-attempt timeout can still count as an upstream failure while the client request remains active.
+Client cancellation stops retries without increasing backend failure counters. Observations use `499` for cancellation and `504` for an expired client deadline; a disconnected client may not receive a response. Total request deadline expiry also records `504`. A route's per-attempt timeout can still count as an upstream failure while the client request remains active.
 
 ## HTTPS
 

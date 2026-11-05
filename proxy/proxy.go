@@ -118,12 +118,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	stopIfCanceled := func() bool {
-		if err := r.Context().Err(); err != nil {
+		if err := requestError(r); err != nil {
 			metricStatus = StatusClientClosedRequest
 			message := "499 Client Closed Request"
 			if errors.Is(err, context.DeadlineExceeded) {
 				metricStatus = http.StatusGatewayTimeout
-				message = "504 Gateway Timeout: client request deadline exceeded"
+				message = "504 Gateway Timeout: request deadline exceeded"
 			}
 			if tracked.status == 0 {
 				http.Error(w, message, metricStatus)
@@ -144,6 +144,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metricRoute = entry.Path
 	if completion := completionFrom(r); completion != nil {
 		completion.route = entry.Path
+	}
+
+	if entry.TotalTimeout > 0 {
+		ctx, cancel := context.WithDeadline(r.Context(), started.Add(entry.TotalTimeout))
+		r = r.WithContext(ctx)
+		defer func() {
+			if errors.Is(requestError(r), context.DeadlineExceeded) {
+				metricStatus = http.StatusGatewayTimeout
+			}
+			cancel()
+		}()
+		// Context cancellation alone does not interrupt an inbound body read.
+		controller := http.NewResponseController(w)
+		deadline, _ := ctx.Deadline()
+		if err := controller.SetReadDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			http.Error(w, "500 Internal Server Error: cannot set request deadline", http.StatusInternalServerError)
+			return
+		}
+		defer controller.SetReadDeadline(time.Time{})
 	}
 
 	if entry.RateLimiter != nil && !entry.RateLimiter.AllowRequest(r) {
@@ -224,7 +243,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// and panics still release it without changing failure accounting.
 			defer result.Done()
 			success, statusCode, err := h.forward(w, r, entry, result, bodyBytes, bufferedBody, maxAttempts > 1)
-			if r.Context().Err() == nil {
+			if requestError(r) == nil {
 				if success && err == nil {
 					result.RecordSuccess()
 				} else if !success {
@@ -233,8 +252,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return success, statusCode
 		}()
-		// A route timeout leaves the original request context alive. Only client
-		// cancellation/deadline stops retries without blaming the backend.
+		// Per-attempt timeouts may retry; the shared request deadline may not.
 		if stopIfCanceled() {
 			return
 		}
@@ -253,6 +271,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		http.Error(w, "502 Bad Gateway: upstream error", http.StatusBadGateway)
 	}
+}
+
+// requestError also handles socket deadlines firing before the context timer.
+func requestError(r *http.Request) error {
+	if err := r.Context().Err(); err != nil {
+		return err
+	}
+	if deadline, ok := r.Context().Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 // statusResponseWriter records the final HTTP status for request metrics.
@@ -380,6 +409,14 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, entry *router.
 	// including trailers discovered while reading the response body.
 	copyHeader(w.Header(), resp.Header)
 
+	if entry.TotalTimeout > 0 {
+		controller := http.NewResponseController(w)
+		deadline, _ := r.Context().Deadline()
+		if err := controller.SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return false, http.StatusBadGateway, err
+		}
+		defer controller.SetWriteDeadline(time.Time{})
+	}
 	w.WriteHeader(resp.StatusCode)
 	var dst io.Writer = w
 	if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mediaType == "text/event-stream" {

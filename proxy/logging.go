@@ -28,7 +28,7 @@ func CompletionLogging(next http.Handler, logger *slog.Logger) http.Handler {
 		finished := false
 		defer func() {
 			panicked := recover()
-			if !finished && !(panicked == http.ErrAbortHandler && c.outcome == "response_error") {
+			if !finished && !(panicked == http.ErrAbortHandler && (c.outcome == "response_error" || c.outcome == "canceled")) {
 				c.outcome = "aborted"
 			}
 			if r.Context().Err() != nil {

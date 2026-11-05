@@ -32,6 +32,8 @@ routes:
     algorithm: "weighted_round_robin"
     retries: 2
     timeout: 3s
+    # Optional budget for uploads, all attempts, and response streaming; 0 disables.
+    total_timeout: 0s
     circuit_breaker:
       failure_threshold: 3
       cooldown: 15s

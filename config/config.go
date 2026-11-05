@@ -90,6 +90,8 @@ func (rl *RateLimit) Defaults() {
 }
 
 type Route struct {
+	// TotalTimeout bounds the whole request; zero disables the total deadline.
+	TotalTimeout   time.Duration         `yaml:"total_timeout,omitempty"`
 	Path           string                `yaml:"path"`
 	StripPrefix    string                `yaml:"strip_prefix"`
 	Rewrite        *RewriteRule          `yaml:"rewrite"`
@@ -398,6 +400,9 @@ func validate(cfg *Config) error {
 		route.RetryMethods, err = NormalizeRetryMethods(route.RetryMethods)
 		if err != nil {
 			return fmt.Errorf("route[%d]: %w", i, err)
+		}
+		if route.TotalTimeout < 0 {
+			return fmt.Errorf("route[%d]: total_timeout must be non-negative", i)
 		}
 		if route.Timeout < 0 {
 			return fmt.Errorf("route[%d]: timeout must be non-negative", i)
