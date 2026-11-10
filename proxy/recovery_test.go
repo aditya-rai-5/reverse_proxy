@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -21,6 +22,10 @@ func TestProxyRecoveryProbeLifecycle(t *testing.T) {
 		failures    int
 	}{
 		{"success", "closed", http.StatusOK, 0},
+		{"client error", "closed", http.StatusBadRequest, 0},
+		{"500", "open", http.StatusInternalServerError, 2},
+		{"503", "open", http.StatusServiceUnavailable, 2},
+		{"599", "open", 599, 2},
 		{"502", "open", http.StatusBadGateway, 2},
 		{"504", "open", http.StatusGatewayTimeout, 2},
 		{"transport", "open", http.StatusBadGateway, 2},
@@ -121,6 +126,39 @@ func TestProxyRecoveryProbeLifecycle(t *testing.T) {
 					t.Fatalf("follow-up: status=%d calls=%d state=%s", next.Code, calls, lb.CircuitBreakerState(0))
 				}
 			})
+		})
+	}
+}
+
+func TestProxyForwardedStatusBreakerAccounting(t *testing.T) {
+	for _, status := range []int{200, 400, 499, 500, 501, 503, 505, 599} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			r, err := router.New(&config.Config{Routes: []config.Route{{
+				Path: "/", Retries: 1,
+				Backends:       []config.Backend{{URL: "http://first"}, {URL: "http://second"}},
+				CircuitBreaker: &config.CircuitBreakerConfig{FailureThreshold: 1, Cooldown: time.Hour},
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			h := NewWithTransport(r, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				return retryTestResponse(status, "upstream response"), nil
+			}))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+			if w.Code != status || w.Body.String() != "upstream response" || calls != 1 {
+				t.Fatalf("status=%d body=%q calls=%d", w.Code, w.Body.String(), calls)
+			}
+			wantState, wantFailures := "closed", 0
+			if status >= 500 {
+				wantState, wantFailures = "open", 1
+			}
+			lb := r.Entries()[0].LB
+			if string(lb.CircuitBreakerState(0)) != wantState || lb.ConsecutiveFailures(0) != wantFailures {
+				t.Fatalf("state=%s failures=%d; want %s, %d", lb.CircuitBreakerState(0), lb.ConsecutiveFailures(0), wantState, wantFailures)
+			}
 		})
 	}
 }

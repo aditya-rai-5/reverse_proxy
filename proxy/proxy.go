@@ -244,9 +244,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			defer result.Done()
 			success, statusCode, err := h.forward(w, r, entry, result, bodyBytes, bufferedBody, maxAttempts > 1)
 			if requestError(r) == nil {
-				if success && err == nil {
+				if success && err == nil && statusCode < http.StatusInternalServerError {
 					result.RecordSuccess()
-				} else if !success {
+				} else if !success || statusCode >= http.StatusInternalServerError {
 					result.RecordFailure()
 				}
 			}
