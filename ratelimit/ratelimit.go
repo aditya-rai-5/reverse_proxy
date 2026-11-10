@@ -169,7 +169,7 @@ func (l *Limiter) RetryAfterHeader() string {
 	return strconv.Itoa(secs)
 }
 
-// CleanupStale removes tracked client IPs that have not been seen within the given ttl of now.
+// CleanupStale removes fully refilled client buckets not seen within the given ttl of now.
 // Returns the number of clients removed.
 func (l *Limiter) CleanupStale(now time.Time, ttl time.Duration) int {
 	if l == nil {
@@ -180,7 +180,7 @@ func (l *Limiter) CleanupStale(now time.Time, ttl time.Duration) int {
 
 	removed := 0
 	for ip, c := range l.clients {
-		if now.Sub(c.lastSeen) > ttl {
+		if now.Sub(c.lastSeen) > ttl && c.limiter.TokensAt(now) >= float64(l.burst) {
 			delete(l.clients, ip)
 			removed++
 		}
