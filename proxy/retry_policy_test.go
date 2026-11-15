@@ -3,7 +3,9 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -520,5 +522,44 @@ func TestProxyOversizedWriteStreamsOnceEvenWithOptIn(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if calls != 1 || rec.Code != http.StatusBadGateway || !body.closed {
 		t.Fatalf("calls=%d status=%d closed=%v", calls, rec.Code, body.closed)
+	}
+}
+
+func TestProxyRetryBufferLimitPreservesBody(t *testing.T) {
+	const payload = "charge=100"
+	for _, limit := range []int64{4, int64(len(payload)), int64(len(payload) + 1), math.MaxInt64 - 1, math.MaxInt64} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			r := retryTestRouter(t, []string{http.MethodPost}, "")
+			calls := 0
+			h := NewWithTransportAndBodyLimit(r, roundTripperFunc(func(out *http.Request) (*http.Response, error) {
+				calls++
+				data, err := io.ReadAll(out.Body)
+				out.Body.Close()
+				if err != nil || string(data) != payload {
+					t.Errorf("attempt %d: body=%q error=%v", calls, data, err)
+				}
+				if out.Header.Get("Idempotency-Key") != "once" {
+					t.Error("idempotency key lost")
+				}
+				if (out.GetBody != nil) != (limit >= int64(len(payload))) {
+					t.Error("unexpected replay eligibility")
+				}
+				if calls == 1 {
+					return retryTestResponse(http.StatusBadGateway, "failed"), nil
+				}
+				return retryTestResponse(http.StatusOK, "done"), nil
+			}), limit)
+			req := httptest.NewRequest(http.MethodPost, "/charge", strings.NewReader(payload))
+			req.Header.Set("Idempotency-Key", "once")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			wantCalls, wantStatus := 2, http.StatusOK
+			if limit < int64(len(payload)) {
+				wantCalls, wantStatus = 1, http.StatusBadGateway
+			}
+			if calls != wantCalls || rec.Code != wantStatus {
+				t.Fatalf("calls=%d status=%d; want %d, %d", calls, rec.Code, wantCalls, wantStatus)
+			}
+		})
 	}
 }

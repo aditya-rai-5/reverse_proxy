@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -187,7 +188,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil && maxAttempts > 1 {
 		// Read at most one byte past the retry-buffer limit. If the body is too
 		// large to replay safely, restore the consumed prefix and stream it once.
-		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, h.maxRequestBodyBytes+1))
+		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, min(h.maxRequestBodyBytes, math.MaxInt64-1)+1))
 		if stopIfCanceled() {
 			_ = r.Body.Close()
 			return
