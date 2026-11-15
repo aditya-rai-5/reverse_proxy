@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -205,4 +206,46 @@ func TestNilLimiter(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("nil limiter Middleware should pass through, got %d", rec.Code)
 	}
+}
+
+func TestCleanupPreservesPartiallyRefilledBucket(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rl := New(Config{RequestsPerMinute: 1, Burst: 10})
+		defer rl.Stop()
+		const ip = "192.0.2.1"
+		for i := 0; i < 10; i++ {
+			if !rl.Allow(ip) {
+				t.Fatal("initial burst rejected")
+			}
+		}
+		if rl.Allow(ip) {
+			t.Fatal("exhausted bucket allowed request")
+		}
+		time.Sleep(4 * time.Minute)
+		synctest.Wait()
+		if got := rl.ClientCount(); got != 1 {
+			t.Errorf("partially refilled bucket removed: clients=%d", got)
+		}
+		for i := 0; i < 4; i++ {
+			if !rl.Allow(ip) {
+				t.Fatal("refilled token rejected")
+			}
+		}
+		if rl.Allow(ip) {
+			t.Fatal("cleanup granted a fresh burst before refill")
+		}
+		time.Sleep(11 * time.Minute)
+		synctest.Wait()
+		if got := rl.ClientCount(); got != 0 {
+			t.Fatalf("fully refilled stale bucket retained: clients=%d", got)
+		}
+		for i := 0; i < 10; i++ {
+			if !rl.Allow(ip) {
+				t.Fatal("fully refilled burst rejected")
+			}
+		}
+		if rl.Allow(ip) {
+			t.Fatal("new bucket exceeded burst")
+		}
+	})
 }
